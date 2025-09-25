@@ -37,6 +37,7 @@ def test_interruption_assigns_both_quotes():
     for item in speech:
         assert item["character"] == "Alice"
         assert item["attribution"]["method"] in {"interruption", "merged_narrator", "postposed_tag_name_first"}
+
         assert item["attribution"]["score"] >= 0.90
 
 

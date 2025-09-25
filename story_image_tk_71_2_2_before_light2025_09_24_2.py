@@ -32,6 +32,7 @@ import statistics
 from collections import defaultdict
 import bisect
 from contextlib import suppress
+
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -160,6 +161,7 @@ def _now_utc() -> int:
     return int(time.time())
 
 
+
 def _ensure_path_stem(path: str) -> str:
     directory = os.path.dirname(path)
     if directory:
@@ -167,7 +169,6 @@ def _ensure_path_stem(path: str) -> str:
     else:
         os.makedirs(".", exist_ok=True)
     return path
-
 
 def _write_json(path: str, obj: Any) -> None:
     with open(path, "w", encoding="utf-8") as fh:
@@ -278,6 +279,7 @@ class DialogueExtractor:
             + r")",
             re.IGNORECASE | re.DOTALL,
         )
+
         self.re_intr = re.compile(
             r"(?:\"|“|„|«|‹)(?P<q1>.+?)(?:\"|”|“|»|›)\s*,\s*(?P<name>"
             + name
@@ -1272,6 +1274,7 @@ def _apply_llm_assist(
                     "phase": "narration",
                     "scene_id": scene_id,
                     "context_span": (payload["context_span"][0], payload["context_span"][1]),
+
                 }
 
     if not candidates:
@@ -1429,8 +1432,12 @@ def _apply_llm_assist(
     return stats
 
 
+    _apply_llm_alternation(utterances)
+    _enforce_closed_set_after_llm(utterances, known_characters, aliases)
+
 def _apply_llm_alternation(utterances: List[Dict[str, Any]]) -> None:
     block: List[Dict[str, Any]] = []
+
 
     def _resolve(segment: List[Dict[str, Any]]) -> None:
         if len(segment) < 3:
@@ -1474,6 +1481,41 @@ def _apply_llm_alternation(utterances: List[Dict[str, Any]]) -> None:
             block.append(utterance)
     if block:
         _resolve(block)
+
+
+    def _resolve(segment: List[Dict[str, Any]]) -> None:
+        if len(segment) < 3:
+            return
+        for idx in range(len(segment) - 1):
+            left = segment[idx]
+            right = segment[idx + 1]
+            if (
+                left.get("character")
+                and right.get("character")
+                and left["character"] not in {"Narrator", "UNATTRIBUTED"}
+                and right["character"] not in {"Narrator", "UNATTRIBUTED"}
+                and left["character"] != right["character"]
+            ):
+                lscore = float((left.get("attribution") or {}).get("score") or 0.0)
+                rscore = float((right.get("attribution") or {}).get("score") or 0.0)
+                if lscore < 0.85 or rscore < 0.85:
+                    continue
+                speakers = [left["character"], right["character"]]
+                expected_index = 0
+                for follow in segment[idx + 2 :]:
+                    if follow.get("character") == "UNATTRIBUTED":
+                        expected = speakers[expected_index % 2]
+                        follow["character"] = expected
+                        follow["attribution"] = {
+                            "method": "alternation_llm",
+                            "score": 0.85,
+                            "evidence": f"alternation:{speakers[0]}/{speakers[1]}",
+                            "name_candidate": expected,
+                        }
+                        expected_index += 1
+                    else:
+                        break
+                break
 
 
 def _enforce_closed_set_after_llm(
@@ -2050,6 +2092,7 @@ def make_scene_fusion_user(ingredients: Dict[str, Any], global_style: str, negat
     cast_block = ingredients.get("cast", [])
     parts.append(json.dumps(cast_block, ensure_ascii=False, indent=2)); parts.append("\n\n")
 
+
     hair_lines: List[str] = []
     ref_locked: List[str] = []
     for entry in cast_block:
@@ -2177,7 +2220,6 @@ def _ensure_assets_dir(world_path: str) -> str:
     os.makedirs(dest, exist_ok=True)
     return dest
 
-
 def _sha1_short(path: str) -> str:
     h = hashlib.sha1()
     try:
@@ -2300,7 +2342,6 @@ def _image_palette_and_luma(img_path: str, max_colors: int = 6) -> Tuple[List[st
     except Exception:
         return [], 0.5
 
-
 def _register_asset(world_obj: Dict[str, Any], img_path: str,
                     *, entity_type: str = "", entity_name: str = "") -> Dict[str, Any]:
     reg = world_obj.setdefault("assets_registry", [])
@@ -2399,7 +2440,6 @@ def _colorfulness(img: Image.Image) -> float:
         return max(0.0, min(1.0, val / 110.0))
     except Exception:
         return 0.5
-
 
 def _edge_density(img: Image.Image) -> float:
     try:
@@ -3069,6 +3109,7 @@ def _maybe_expand_scenes(analysis_path: str,
                     total += 1
         return total
 
+
     story_text = ""
     analysis_dict = (
         updated_analysis if isinstance(updated_analysis, dict)
@@ -3429,8 +3470,6 @@ ANALYZE_SYSTEM = (
     "Scenes should include: id, title, what_happens, description, characters_present (names), location (name), "
     "key_actions, tone, time_of_day, movement_id, beat_type, plot_devices (list of {name, event, notes}), is_plot_device_intro (bool), plot_device_focus (device name or \"\")."
 )
-
-
 
 def make_analyze_user(story: str) -> str:
     parts = []
@@ -3851,9 +3890,11 @@ def compose_character_dna(c: CharacterProfile, max_len: int = 3000) -> str:
     elif c.refined_description or c.initial_description:
         parts.append((c.refined_description or c.initial_description))
     if c.visual_cues_from_photos: parts.append("Visual cues: " + c.visual_cues_from_photos)
+
     dna = " ".join(parts)
     dna = re.sub(r"\s+", " ", dna).strip()
     return dna[:max_len]
+
 
 def compose_location_dna(l: LocationProfile, max_len: int = 3500) -> str:
     parts = []
@@ -3898,6 +3939,7 @@ HAIR_DESCRIPTOR_PATTERNS: List[tuple[str, str]] = [
     ("white hair", r"\bwhite(?:\s+hair|[- ]haired)?\b"),
 ]
 
+
 def extract_hair_descriptor(text: str) -> Optional[str]:
     """Return a concise hair descriptor (e.g., 'blonde hair') if one is present."""
     if not text:
@@ -3918,7 +3960,6 @@ def join_clause(items: List[str]) -> str:
     if len(filtered) == 2:
         return f"{filtered[0]} and {filtered[1]}"
     return ", ".join(filtered[:-1]) + f", and {filtered[-1]}"
-
 
 def compose_master_scene_prompt(base_prompt: str,
                                 sc: Dict[str,Any],
@@ -5873,6 +5914,7 @@ class App:
             "characters": strip_data_uris(rg_chars),
             "locations":  strip_data_uris(rg_locs),
         }
+
         w["scene"] = scene
         if size_bytes(w) <= limit:
             return w
@@ -7201,6 +7243,63 @@ class App:
         return {"preset": None, "id": "", "name": fallback_name}
 
 
+        # 3) Locations
+        raw_locs = (self.world.get("locations") or {})
+        if isinstance(raw_locs, list):
+            loc_map = { (d.get("name","") or "").strip(): d for d in raw_locs if isinstance(d, dict) and d.get("name") }
+        else:
+            loc_map = { (k or "").strip(): (v or {}) for k, v in raw_locs.items() }
+    
+        for nm_raw, entry in loc_map.items():
+            nm = (nm_raw or "").strip()
+            if not nm:
+                continue
+            target_name = state_locs_by_sn.get(sanitize_name(nm)) or nm
+            l = self.locations.get(target_name)
+            if not l and create_missing:
+                l = LocationProfile(name=target_name, description=entry.get("description",""))
+                self.locations[target_name] = l
+            if not l:
+                continue
+            baseline = entry.get("sheet_base_prompt") or entry.get("dna") or entry.get("visual_dna") or entry.get("baseline") or ""
+            if baseline and not l.sheet_base_prompt:
+                l.sheet_base_prompt = baseline
+            if entry.get("description") and not l.description:
+                l.description = entry["description"]
+            cues_raw = entry.get("visual_cues_from_photos")
+            if cues_raw:
+                txt, cues_list = _normalize_visual_cues_value(cues_raw)
+                existing_list = getattr(l, "visual_cues_from_photos_list", []) or []
+                combined = list(dict.fromkeys(existing_list + cues_list)) if cues_list else existing_list
+                if combined:
+                    l.visual_cues_from_photos_list = combined
+                    l.visual_cues_from_photos = "; ".join(combined)
+                elif txt and not l.visual_cues_from_photos:
+                    l.visual_cues_from_photos = txt
+            else:
+                if not getattr(l, "visual_cues_from_photos_list", None):
+                    l.visual_cues_from_photos_list = []
+            ids = list(dict.fromkeys(entry.get("reference_image_ids") or []))
+            for aid in ids:
+                if aid not in l.reference_images:
+                    l.reference_images.append(aid)
+            pri = (entry.get("primary_reference_id") or "").strip()
+            if pri:
+                l.primary_reference_id = pri
+            if not l.primary_reference_id and l.reference_images:
+                l.primary_reference_id = l.reference_images[0]
+            traits = entry.get("dna_traits")
+            if isinstance(traits, dict):
+                if not isinstance(l.dna_traits, dict):
+                    l.dna_traits = {}
+                for key, value in traits.items():
+                    if key not in l.dna_traits:
+                        l.dna_traits[key] = value
+                    elif isinstance(l.dna_traits.get(key), dict) and isinstance(value, dict):
+                        for subk, subv in value.items():
+                            if subk not in l.dna_traits[key]:
+                                l.dna_traits[key][subk] = subv
+
     def _load_user_styles(self) -> None:
         styles_list = []
         if isinstance(self.world, dict):
@@ -7308,10 +7407,10 @@ class App:
                 if isinstance(item, dict) and item.get("id") == asset_id:
                     pth = item.get("path")
                     return pth if isinstance(pth, str) else ""
+
         except Exception:
             return ""
         return ""
-
 
     def _find_profile_by_name(self, name: str, kind_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[Any]]:
         target = (name or "").strip()
@@ -7834,6 +7933,7 @@ class App:
         self._build_tab_locations()
         self._build_tab_shots_export()
 
+
         try:
             if isinstance(self.analysis, dict):
                 title = self.analysis.get("title")
@@ -8073,58 +8173,23 @@ class App:
         sid = (getattr(self, "selected_style_id", "") or "").strip()
         styles = []
         try:
-            styles = (self.world or {}).get("style_presets") or []
-        except Exception:
-            styles = []
-        if sid:
-            for preset in styles:
-                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    name = (preset.get("name") or preset.get("id") or "").strip()
-                    return preset, name
-        return None, ""
-
-
-    def _style_prompt_bits(self) -> List[str]:
-        bits: List[str] = []
-        preset, _ = self._resolve_selected_style()
-        if not preset:
-            return bits
-        desc = (preset.get("style_prompt") or "").strip()
-        if desc:
-            bits.append("Style: " + desc)
-        palette = [c for c in (preset.get("palette") or []) if c][:4]
-        if palette:
-            bits.append("Style palette: " + ", ".join(palette))
-        return bits
-
-
-    def _current_style_snapshot(self) -> Dict[str, Any]:
-        preset, preset_name = self._resolve_selected_style()
-        if preset:
-            return {
-                "preset": preset,
-                "id": preset.get("id", ""),
-                "name": preset_name or preset.get("name", ""),
-            }
-        fallback_name = getattr(self, "selected_style_name", "") or getattr(self, "global_style", "")
-        return {"preset": None, "id": "", "name": fallback_name}
-
-
-    def _load_user_styles(self) -> None:
-        styles_list = []
-        if isinstance(self.world, dict):
-            raw = self.world.get("style_presets")
-            if isinstance(raw, list):
-                styles_list = raw
-        self._user_styles = styles_list
-
-        payload = _read_json_safely(_styles_store_path())
-        if isinstance(payload, dict):
-            source = payload.get("styles") or payload.get("style_presets") or []
-        elif isinstance(payload, list):
-            source = payload
-        else:
-            source = []
+            prompt_for_api = self._augment_prompt_for_render(prompt)
+            if refs:
+                return self.client.generate_images_b64_with_refs(
+                    model=self.image_model,
+                    prompt=prompt_for_api,
+                    size=target_size,
+                    ref_data_uris=refs,
+                    n=n
+                )
+            return self.client.generate_images_b64(
+                model=self.image_model,
+                prompt=prompt_for_api,
+                size=target_size,
+                n=n
+            )
+        except Exception as e:
+            raise RuntimeError(f"Image generation failed ({target_size}): {e}") from e
 
         existing_by_id: Dict[str, Dict[str, Any]] = {}
         for entry in self._user_styles:
@@ -8133,57 +8198,104 @@ class App:
                 if sid:
                     existing_by_id[sid] = entry
 
-        for entry in source:
-            if not isinstance(entry, dict):
-                continue
-            sid = (entry.get("id") or "").strip()
-            if sid and sid in existing_by_id:
-                try:
-                    existing_by_id[sid].update(entry)
-                except Exception:
-                    pass
-            else:
-                self._user_styles.append(entry)
-                if sid:
-                    existing_by_id[sid] = entry
-
-        if isinstance(self.world, dict):
-            self.world["style_presets"] = self._user_styles
-
-
-    def _save_user_styles(self) -> None:
+    def _current_exposure_settings(self) -> tuple[float, bool, float]:
         try:
-            styles = [s for s in getattr(self, "_user_styles", []) if isinstance(s, dict)]
-            payload = {"styles": styles}
-            path = _styles_store_path()
-            ensure_dir(os.path.dirname(path) or ".")
-            _write_json_atomic(path, payload)
-        except Exception as exc:
-            try:
-                print(f"[style] warning: failed to save user styles: {exc}")
-            except Exception:
-                pass
-
-
-    def _merge_styles_for_dropdown(self) -> None:
-        try:
-            if not isinstance(self.world, dict):
-                return
-            styles = getattr(self, "_user_styles", None)
-            if styles is None:
-                styles = []
-            current = self.world.setdefault("style_presets", [])
-            if current is not styles:
-                self.world["style_presets"] = styles
-            self._refresh_style_dropdown(preserve_selection=False)
+            bias = float(getattr(self, "exposure_bias", EXPOSURE_BIAS))
         except Exception:
+            bias = float(EXPOSURE_BIAS)
+        try:
+            post = bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP))
+        except Exception:
+            post = bool(EXPOSURE_POST_TONEMAP)
+        try:
+            emiss = float(getattr(self, "emissive_level", EMISSIVE_LEVEL))
+        except Exception:
+            emiss = float(EMISSIVE_LEVEL)
+        return bias, post, emiss
+
+    def _augment_prompt_for_render(self, prompt: str) -> str:
+        bias, _, emiss = self._current_exposure_settings()
+        try:
+            base = str(prompt or "")
+        except Exception:
+            base = ""
+        cleaned_lines: list[str] = []
+        for line in base.splitlines():
+            strip = line.strip().lower()
+            if strip.startswith("exposure control:") or strip.startswith("emissive lighting:"):
+                continue
+            cleaned_lines.append(line)
+        base_txt = "\n".join(cleaned_lines).strip()
+        parts: list[str] = [base_txt] if base_txt else []
+        parts.append("Exposure control: " + exposure_language(bias))
+        if abs(emiss) >= 0.15:
+            parts.append("Emissive lighting: " + emissive_language(emiss))
+        augmented = "\n".join(parts)
+        try:
+            print(f"[prompt] exposure={bias:+.2f} emissive={emiss:+.2f}")
+        except Exception:
+            pass
+        return augmented
+
+    def _process_generated_image(
+        self, raw: bytes, ext: str | None = None, *, need_image: bool = False
+    ) -> tuple[bytes, Optional["Image.Image"]]:
+        bias, post, _ = self._current_exposure_settings()
+        processed = raw
+        img_obj: Optional["Image.Image"] = None
+        log_msg = None
+        if post and abs(bias) >= 0.05:
             try:
-                self._refresh_style_dropdown(preserve_selection=False)
+                buf = io.BytesIO(raw)
+                with Image.open(buf) as im:
+                    im.load()
+                    tonemapped = apply_exposure_tonemap(im, bias)
+                    out_buf = io.BytesIO()
+                    fmt = None
+                    if ext:
+                        fmt = {
+                            ".png": "PNG",
+                            ".jpg": "JPEG",
+                            ".jpeg": "JPEG",
+                            ".webp": "WEBP",
+                        }.get(ext.lower())
+                    if not fmt:
+                        fmt = tonemapped.format or "PNG"
+                    save_img = tonemapped
+                    if fmt == "JPEG" and tonemapped.mode == "RGBA":
+                        save_img = tonemapped.convert("RGB")
+                    save_img.save(out_buf, format=fmt)
+                    processed = out_buf.getvalue()
+                    img_obj = tonemapped.copy()
+                    log_msg = f"[exposure] post tone-map applied (bias={bias:+.2f})"
+            except Exception as e:
+                log_msg = f"[exposure] tone-map skipped: {e}"
+                img_obj = None
+                processed = raw
+        if need_image and img_obj is None:
+            try:
+                buf = io.BytesIO(processed)
+                with Image.open(buf) as im:
+                    im.load()
+                    img_obj = im.copy()
+            except Exception:
+                img_obj = None
+        if log_msg:
+            try:
+                print(log_msg)
             except Exception:
                 pass
+        return processed, img_obj
+
+    def _process_image_batch(self, imgs: list[bytes], ext: str | None = None) -> list[bytes]:
+        processed: list[bytes] = []
+        for b in imgs or []:
+            pb, _ = self._process_generated_image(b, ext=ext, need_image=False)
+            processed.append(pb)
+        return processed
 
 
-    def _load_thumb(self, path: str, max_side: int = 160):
+    def _build_ui(self):
         """
         Load a thumbnail ImageTk.PhotoImage, caching in self._thumb_cache.
         Returns (imgtk, (w, h)) or (None, (0, 0)) on failure.
@@ -8246,6 +8358,7 @@ class App:
             order = ["character", "location"]
         else:
             order = ["character", "location"]
+
 
         for kind in order:
             pool = self.characters if kind == "character" else self.locations
@@ -8333,16 +8446,11 @@ class App:
             profile.visual_cues_from_photos_list = existing_cues
             profile.visual_cues_from_photos = "; ".join(existing_cues)
 
-            traits = self._llm_extract_relevant_traits(dst, analysis_ctx)
-            if traits:
-                profile.dna_traits = self._merge_dna_maps(profile.dna_traits, traits)
 
-        entry["reference_image_ids"] = list(dict.fromkeys(profile.reference_images))
-        entry["visual_cues_from_photos"] = list(profile.visual_cues_from_photos_list or [])
-        if profile.primary_reference_id:
-            entry["primary_reference_id"] = profile.primary_reference_id
-        if profile.dna_traits:
-            entry["dna_traits"] = profile.dna_traits
+        # Initialize per-run budget line on the right
+        self._init_run_budget()
+        ttk.Label(bar, textvariable=self.budget_var, anchor="e").pack(side="right", padx=6)
+
 
         try:
             if world_path:
@@ -8828,110 +8936,106 @@ class App:
         target_size = self._normalize_size(requested)
     
         try:
-            prompt_for_api = self._augment_prompt_for_render(prompt)
-            if refs:
-                return self.client.generate_images_b64_with_refs(
-                    model=self.image_model,
-                    prompt=prompt_for_api,
-                    size=target_size,
-                    ref_data_uris=refs,
-                    n=n
-                )
-            return self.client.generate_images_b64(
-                model=self.image_model,
-                prompt=prompt_for_api,
-                size=target_size,
-                n=n
-            )
-        except Exception as e:
-            raise RuntimeError(f"Image generation failed ({target_size}): {e}") from e
+            styles = (self.world or {}).get("style_presets") or []
+        except Exception:
+            styles = []
+        if sid:
+            for preset in styles:
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    name = (preset.get("name") or preset.get("id") or "").strip()
+                    return preset, name
+        return None, ""
 
 
-    def _current_exposure_settings(self) -> tuple[float, bool, float]:
-        try:
-            bias = float(getattr(self, "exposure_bias", EXPOSURE_BIAS))
-        except Exception:
-            bias = float(EXPOSURE_BIAS)
-        try:
-            post = bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP))
-        except Exception:
-            post = bool(EXPOSURE_POST_TONEMAP)
-        try:
-            emiss = float(getattr(self, "emissive_level", EMISSIVE_LEVEL))
-        except Exception:
-            emiss = float(EMISSIVE_LEVEL)
-        return bias, post, emiss
+    def _style_prompt_bits(self) -> List[str]:
+        bits: List[str] = []
+        preset, _ = self._resolve_selected_style()
+        if not preset:
+            return bits
+        desc = (preset.get("style_prompt") or "").strip()
+        if desc:
+            bits.append("Style: " + desc)
+        palette = [c for c in (preset.get("palette") or []) if c][:4]
+        if palette:
+            bits.append("Style palette: " + ", ".join(palette))
+        return bits
 
-    def _augment_prompt_for_render(self, prompt: str) -> str:
-        bias, _, emiss = self._current_exposure_settings()
-        try:
-            base = str(prompt or "")
-        except Exception:
-            base = ""
-        cleaned_lines: list[str] = []
-        for line in base.splitlines():
-            strip = line.strip().lower()
-            if strip.startswith("exposure control:") or strip.startswith("emissive lighting:"):
+
+    def _current_style_snapshot(self) -> Dict[str, Any]:
+        preset, preset_name = self._resolve_selected_style()
+        if preset:
+            return {
+                "preset": preset,
+                "id": preset.get("id", ""),
+                "name": preset_name or preset.get("name", ""),
+            }
+        fallback_name = getattr(self, "selected_style_name", "") or getattr(self, "global_style", "")
+        return {"preset": None, "id": "", "name": fallback_name}
+
+
+    def _load_user_styles(self) -> None:
+        styles_list = []
+        if isinstance(self.world, dict):
+            raw = self.world.get("style_presets")
+            if isinstance(raw, list):
+                styles_list = raw
+        self._user_styles = styles_list
+
+        payload = _read_json_safely(_styles_store_path())
+        if isinstance(payload, dict):
+            source = payload.get("styles") or payload.get("style_presets") or []
+        elif isinstance(payload, list):
+            source = payload
+        else:
+            source = []
+
+
+        for entry in source:
+            if not isinstance(entry, dict):
                 continue
-            cleaned_lines.append(line)
-        base_txt = "\n".join(cleaned_lines).strip()
-        parts: list[str] = [base_txt] if base_txt else []
-        parts.append("Exposure control: " + exposure_language(bias))
-        if abs(emiss) >= 0.15:
-            parts.append("Emissive lighting: " + emissive_language(emiss))
-        augmented = "\n".join(parts)
-        try:
-            print(f"[prompt] exposure={bias:+.2f} emissive={emiss:+.2f}")
-        except Exception:
-            pass
-        return augmented
+            sid = (entry.get("id") or "").strip()
+            if sid and sid in existing_by_id:
+                try:
+                    existing_by_id[sid].update(entry)
+                except Exception:
+                    pass
+            else:
+                self._user_styles.append(entry)
+                if sid:
+                    existing_by_id[sid] = entry
 
-    def _process_generated_image(
-        self, raw: bytes, ext: str | None = None, *, need_image: bool = False
-    ) -> tuple[bytes, Optional["Image.Image"]]:
-        bias, post, _ = self._current_exposure_settings()
-        processed = raw
-        img_obj: Optional["Image.Image"] = None
-        log_msg = None
-        if post and abs(bias) >= 0.05:
+        if isinstance(self.world, dict):
+            self.world["style_presets"] = self._user_styles
+
+
+    def _save_user_styles(self) -> None:
+        try:
+            styles = [s for s in getattr(self, "_user_styles", []) if isinstance(s, dict)]
+            payload = {"styles": styles}
+            path = _styles_store_path()
+            ensure_dir(os.path.dirname(path) or ".")
+            _write_json_atomic(path, payload)
+        except Exception as exc:
             try:
-                buf = io.BytesIO(raw)
-                with Image.open(buf) as im:
-                    im.load()
-                    tonemapped = apply_exposure_tonemap(im, bias)
-                    out_buf = io.BytesIO()
-                    fmt = None
-                    if ext:
-                        fmt = {
-                            ".png": "PNG",
-                            ".jpg": "JPEG",
-                            ".jpeg": "JPEG",
-                            ".webp": "WEBP",
-                        }.get(ext.lower())
-                    if not fmt:
-                        fmt = tonemapped.format or "PNG"
-                    save_img = tonemapped
-                    if fmt == "JPEG" and tonemapped.mode == "RGBA":
-                        save_img = tonemapped.convert("RGB")
-                    save_img.save(out_buf, format=fmt)
-                    processed = out_buf.getvalue()
-                    img_obj = tonemapped.copy()
-                    log_msg = f"[exposure] post tone-map applied (bias={bias:+.2f})"
-            except Exception as e:
-                log_msg = f"[exposure] tone-map skipped: {e}"
-                img_obj = None
-                processed = raw
-        if need_image and img_obj is None:
-            try:
-                buf = io.BytesIO(processed)
-                with Image.open(buf) as im:
-                    im.load()
-                    img_obj = im.copy()
+                print(f"[style] warning: failed to save user styles: {exc}")
             except Exception:
-                img_obj = None
-        if log_msg:
+                pass
+
+
+    def _merge_styles_for_dropdown(self) -> None:
+        try:
+            if not isinstance(self.world, dict):
+                return
+            styles = getattr(self, "_user_styles", None)
+            if styles is None:
+                styles = []
+            current = self.world.setdefault("style_presets", [])
+            if current is not styles:
+                self.world["style_presets"] = styles
+            self._refresh_style_dropdown(preserve_selection=False)
+        except Exception:
             try:
-                print(log_msg)
+                self._refresh_style_dropdown(preserve_selection=False)
             except Exception:
                 pass
         return processed, img_obj
@@ -9118,6 +9222,1033 @@ class App:
 
 
 
+
+    def _on_run_batch_from_ui(self):
+        import os, threading
+        stories_dir  = (self.batch_stories_dir.get()  or "").strip()
+        profiles_dir = (self.batch_profiles_dir.get() or "").strip()
+        out_dir      = (self.batch_out_dir.get()      or "").strip()
+    
+        if not stories_dir or not os.path.isdir(stories_dir):
+            messagebox.showerror("Batch", "Choose a valid stories folder with .txt files."); return
+        if not out_dir:
+            messagebox.showerror("Batch", "Choose an output folder."); return
+    
+        if not self.client:
+            self._on_connect()
+            if not self.client: return
+    
+        # Honor aspect from the picker
+        try:
+            self.scene_render_aspect = (self.batch_aspect.get() or self.scene_render_aspect).strip()
+        except Exception:
+            pass
+    
+        # Robust coverage fallback
+
+        try:
+            coverage = (self.batch_coverage_mode.get() or "min").strip().lower()
+        except Exception:
+            coverage = "min"
+
+        # Snapshot min-words knob on the UI thread so worker threads don't touch Tk state
+        batch_min_words = None
+        try:
+            if hasattr(self, "batch_min_words_var"):
+                raw = (self.batch_min_words_var.get() or "").strip()
+                if raw != "":
+                    batch_min_words = int(raw)
+        except Exception:
+            batch_min_words = None
+        if batch_min_words is None:
+            try:
+                batch_min_words = int(getattr(self, "min_words_between_images", 0) or 0)
+            except Exception:
+                batch_min_words = 0
+
+        prog = ProgressWindow(self.root, title="Batch")
+        prog.set_status("Running…")
+        prog.set_progress(2)
+    
+        def cb(pct: float, text: str | None = None):
+            def _u():
+                if text:
+                    prog.set_status(text); prog.append_log(text)
+                prog.set_progress(0 if pct is None else pct)
+            self.root.after(0, _u)
+    
+        def gui_log(line: str):
+            self.root.after(0, lambda: prog.append_log(line))
+    
+        def worker():
+            err = None
+            try:
+                self.run_batch_on_folder(
+                    stories_dir=stories_dir,
+                    profiles_dir=profiles_dir or os.path.join(out_dir, "_profiles_repo"),
+                    out_root=out_dir,
+                    prompt_policy=(self.batch_policy.get() or "final_prompt"),
+                    render_n=max(1, int(self.batch_render_n.get())),
+                    delay_s=max(0, int(self.batch_delay_s.get() or 0)),
+                    aspect=self.scene_render_aspect,
+                    coverage_mode=coverage,  # "min" or "max"
+                    min_words_per_image=batch_min_words,
+                    progress_cb=cb,
+                    log_cb=gui_log,
+                )
+                # NEW: Collate everything into out_dir/_COLLATED
+                try:
+                    collated = self._collate_all_renders(out_dir)
+                    if collated:
+                        gui_log(f"Collated renders → {collated}")
+                except Exception as ce:
+                    gui_log(f"Collate step failed: {ce}")
+            except Exception as e:
+                err = e
+            finally:
+                self.root.after(0, prog.close)
+                if err:
+                    self.root.after(0, lambda: messagebox.showerror("Batch", f"Batch failed:\n{err}"))
+                else:
+                    self.root.after(0, lambda: messagebox.showinfo("Batch", f"Done.\nOutput: {out_dir}"))
+    
+        threading.Thread(target=worker, daemon=True).start()
+
+
+
+
+    def _init_run_budget(self):
+        """Initialize per-run counters and the readout StringVar."""
+        # Counters (persist on self)
+        try:
+            self.run_tokens_prompt = int(getattr(self, "run_tokens_prompt", 0))
+            self.run_tokens_completion = int(getattr(self, "run_tokens_completion", 0))
+            self.run_images = int(getattr(self, "run_images", 0))
+        except Exception:
+            self.run_tokens_prompt = 0
+            self.run_tokens_completion = 0
+            self.run_images = 0
+        # Readout
+        self.budget_var = getattr(self, "budget_var", tk.StringVar(value="Run est.: tokens 0 (0/0)  •  images 0"))
+        self._budget_update_label()
+
+    def _inc_tokens(self, prompt: int = 0, completion: int = 0):
+        """Add token counts and refresh the budget readout."""
+        try:
+            self.run_tokens_prompt += int(max(0, prompt))
+            self.run_tokens_completion += int(max(0, completion))
+            self._budget_update_label()
+        except Exception:
+            pass
+
+    def _inc_images_rendered(self, n: int = 1):
+        """Bump the count of rendered images for this run and refresh the readout."""
+        try:
+            self.run_images += int(max(0, n))
+            self._budget_update_label()
+        except Exception:
+            pass
+
+    def _budget_update_label(self):
+        """Format the per-run budget label text."""
+        try:
+            p = int(getattr(self, "run_tokens_prompt", 0))
+            c = int(getattr(self, "run_tokens_completion", 0))
+            total = p + c
+            imgs = int(getattr(self, "run_images", 0))
+            txt = f"Run est.: tokens {total:,} ({p:,}/{c:,})  •  images {imgs:,}"
+            # If you later add $/1k token + per-image estimates in Settings,
+            # you can append "  •  ≈ $X.YY" here.
+            self.budget_var.set(txt)
+        except Exception:
+            # Be defensive: never crash UI updates
+            try:
+                self.budget_var.set("Run est.: tokens —  •  images —")
+            except Exception:
+                pass
+
+    def _on_import_analysis_json(self):
+        """
+        Let the user pick any _analysis.json and merge it into the current session.
+        - Updates self.analysis and scene table
+        - Seeds characters/locations if they are missing
+        - Reapplies world baselines so profiles auto‑load
+        """
+        p = filedialog.askopenfilename(
+            title="Choose an _analysis.json",
+            filetypes=[("JSON","*_analysis.json"), ("JSON","*.json")]
+        )
+        if not p:
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                ana = json.load(f)
+            if not isinstance(ana, dict):
+                raise ValueError("File is not a JSON object.")
+        except Exception as e:
+            messagebox.showerror("Import analysis", f"Could not read JSON:\n{e}")
+            return
+
+        # Normalize the few fields we rely on
+        self.analysis = {
+            "story_precis": ana.get("story_precis", ana.get("story_summary","")),
+            "story_summary": ana.get("story_summary",""),
+            "main_characters": ana.get("main_characters", []),
+            "locations": ana.get("locations", []),
+            "structure": ana.get("structure", {}),
+            "plot_devices": ana.get("plot_devices", []),
+            "scenes": ana.get("scenes", []),
+
+        }
+
+        # Seed entities if missing
+        for c in self.analysis.get("main_characters", []):
+            nm = (c.get("name","") or "").strip()
+            if nm and nm not in self.characters:
+                self.characters[nm] = CharacterProfile(name=nm, initial_description=c.get("initial_description",""))
+        for l in self.analysis.get("locations", []):
+            nm = (l.get("name","") or "").strip()
+            if nm and nm not in self.locations:
+                self.locations[nm] = LocationProfile(name=nm, description=l.get("description",""))
+
+        # Reapply baselines from world.json so the profiles show up immediately
+        try:
+            self._apply_world_baselines_to_state(create_missing=False)
+        except Exception:
+            pass
+
+        # Refresh Story/Scenes tab UI
+        try:
+            self.scenes_by_id = {s.get("id",""): s for s in (self.analysis.get("scenes") or []) if s.get("id")}
+            self._render_scene_table()
+            self._render_precis_and_movements()
+        except Exception:
+            pass
+
+        # Refresh Characters & Locations panes
+        try:
+            self._rebuild_character_panels()
+            self._rebuild_location_panels()
+        except Exception:
+            pass
+
+        self._set_status("Imported prior analysis.")
+        messagebox.showinfo("Analysis import", "Analysis loaded and applied.")
+
+    def _build_style_combo_options(self) -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+        values: List[str] = []
+        mapping: Dict[str, Dict[str, Any]] = {}
+        id_map: Dict[str, str] = {}
+
+        seen: set[str] = set()
+        for name in GLOBAL_STYLE_CHOICES:
+            label = name
+            values.append(label)
+            mapping[label] = {"kind": "builtin", "name": label}
+            seen.add(label)
+
+        styles: List[Dict[str, Any]]
+        try:
+            styles = [s for s in (self.world or {}).get("style_presets", []) if isinstance(s, dict)]
+        except Exception:
+            styles = []
+
+        if styles:
+            separator = "— User Styles —"
+            values.append(separator)
+            mapping[separator] = {"kind": "separator"}
+            seen.add(separator)
+            for preset in styles:
+                base = (preset.get("name") or preset.get("id") or "User style").strip() or "User style"
+                display = base
+                suffix = 2
+                while display in seen:
+                    display = f"{base} ({suffix})"
+                    suffix += 1
+                values.append(display)
+                mapping[display] = {"kind": "user", "preset": preset}
+                seen.add(display)
+                pid = (preset.get("id") or "").strip()
+                if pid:
+                    id_map[pid] = display
+
+        return values, mapping, id_map
+
+    def _apply_style_selection_from_display(self, display: str, *, quiet: bool = False) -> None:
+        info = self._style_combo_mapping.get(display)
+        if not info:
+            self.selected_style_id = ""
+            self.selected_style_name = display
+            if display:
+                self.global_style = display
+            return
+
+        kind = info.get("kind")
+        if kind == "separator":
+            return
+        if kind == "user":
+            preset = info.get("preset") or {}
+            pid = (preset.get("id") or "").strip()
+            self.selected_style_id = pid
+            self.selected_style_name = (preset.get("name") or preset.get("id") or "").strip()
+            if self.selected_style_name:
+                self.global_style = self.selected_style_name
+            if not quiet:
+                try:
+                    self._set_status(f"Style preset: {self.selected_style_name}")
+                except Exception:
+                    pass
+        else:
+            self.selected_style_id = ""
+            self.selected_style_name = display
+            if display:
+                self.global_style = display
+            if not quiet:
+                try:
+                    self._set_status(f"Global style: {display}")
+                except Exception:
+                    pass
+
+
+    def _refresh_style_dropdown(self, preserve_selection: bool = True) -> None:
+        combo = getattr(self, "style_combo", None)
+        if combo is None:
+            return
+
+        values, mapping, id_map = self._build_style_combo_options()
+        self._style_combo_mapping = mapping
+        self._style_display_by_id = id_map
+        try:
+            combo.configure(values=values)
+        except Exception:
+            combo["values"] = values
+
+        desired_display = None
+
+        # 1) If we were told to preserve, try the currently selected style id
+        if preserve_selection and self.selected_style_id:
+            desired_display = id_map.get(self.selected_style_id)
+
+        # 2) If no selection yet, prefer default_style_id from world.json
+        if not desired_display:
+            try:
+                dsid = (self.world or {}).get("default_style_id") or ""
+                if dsid:
+                    desired_display = id_map.get(dsid)
+                    if desired_display:
+                        self.selected_style_id = dsid
+            except Exception:
+                pass
+
+        # 3) Next, prefer a previously selected style name when it’s builtin
+        if not desired_display and not self.selected_style_id and self.global_style:
+            info = mapping.get(self.global_style)
+            if info and info.get("kind") == "builtin":
+                desired_display = self.global_style
+
+        # 4) Otherwise pick the first non-separator item
+        if not desired_display:
+            for candidate in values:
+                info = mapping.get(candidate)
+                if info and info.get("kind") != "separator":
+                    desired_display = candidate
+                    break
+        if desired_display:
+            try:
+                combo.set(desired_display)
+            except Exception:
+                pass
+            self._apply_style_selection_from_display(desired_display, quiet=True)
+
+    def _on_style_selected(self, _event=None):
+        combo = getattr(self, "style_combo", None)
+        if combo is None:
+            return
+        current = combo.get().strip()
+        info = self._style_combo_mapping.get(current)
+        if info and info.get("kind") == "separator":
+            previous_display = None
+            if self.selected_style_id:
+                previous_display = self._style_display_by_id.get(self.selected_style_id)
+            if not previous_display:
+                previous_display = self.selected_style_name or self.global_style or GLOBAL_STYLE_DEFAULT
+            if previous_display:
+                try:
+                    combo.set(previous_display)
+                except Exception:
+                    pass
+                self._apply_style_selection_from_display(previous_display, quiet=True)
+            return
+        self._apply_style_selection_from_display(current, quiet=False)
+        self._refresh_style_dropdown(preserve_selection=True)
+
+    def _export_style_dialog(self):
+        if getattr(self, "root", None) is None:
+            print("[style] export not available in headless mode")
+            return
+        sel_id = (getattr(self, "selected_style_id", "") or "").strip()
+        target = None
+        for preset in getattr(self, "_user_styles", []) or []:
+            if isinstance(preset, dict) and (preset.get("id") or "").strip() == sel_id:
+                target = preset
+                break
+        if not target:
+            try:
+                messagebox.showinfo("Export Style", "Select a user style to export.")
+            except Exception:
+                print("[style] select a user style to export")
+            return
+
+        default_name = (target.get("name") or target.get("id") or "style").strip() or "style"
+        default_name = sanitize_name(default_name) or "style"
+        out_path = filedialog.asksaveasfilename(
+            title="Export Style",
+            defaultextension=".style.json",
+            initialfile=f"{default_name}.style.json",
+            filetypes=[("Style JSON", "*.style.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        contrast = sum(contrast_vals) / len(contrast_vals) if contrast_vals else 0.5
+        colorfulness = sum(color_vals) / len(color_vals) if color_vals else 0.5
+        edge = sum(edge_vals) / len(edge_vals) if edge_vals else 0.4
+        tone = _tone_bias(flat_palette)
+        grain = _grain_hint(contrast, edge)
+        base_prompt = _summarize_style_prompt(flat_palette, contrast, colorfulness, edge, tone, grain)
+        analysis_ctx = ""
+        try:
+            analysis_ctx = self._analysis_context_snippet()
+        except Exception:
+            analysis_ctx = ""
+        style_desc = _llm_style_summary(self, sample_paths, analysis_ctx, base_prompt)
+
+        preset_id = f"style_{int(time.time())}_{hashlib.md5(cleaned_name.encode('utf-8')).hexdigest()[:6]}"
+        preset = {
+            "id": preset_id,
+            "name": cleaned_name,
+            "sample_asset_ids": asset_ids,
+            "palette": flat_palette,
+            "contrast": round(float(contrast), 3),
+            "colorfulness": round(float(colorfulness), 3),
+            "edge_density": round(float(edge), 3),
+            "tone_bias": tone,
+            "grain_hint": grain,
+            "style_prompt": style_desc,
+        }
+
+        try:
+            styles = (self.world or {}).setdefault("style_presets", [])
+        except Exception:
+            self.world["style_presets"] = []
+            styles = self.world["style_presets"]
+        styles.append(preset)
+
+        try:
+            if self.world_store_path:
+                self._save_world_store_to(self.world_store_path)
+        except Exception:
+            pass
+
+        print(f"[style] created preset '{cleaned_name}' with {len(asset_ids)} samples")
+        return preset
+
+
+    def _resolve_selected_style(self) -> Tuple[Optional[Dict[str, Any]], str]:
+        sid = (getattr(self, "selected_style_id", "") or "").strip()
+        styles = []
+        try:
+            styles = (self.world or {}).get("style_presets") or []
+        except Exception:
+            styles = []
+        if sid:
+            for preset in styles:
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    name = (preset.get("name") or preset.get("id") or "").strip()
+                    return preset, name
+        return None, ""
+
+
+    def _style_prompt_bits(self) -> List[str]:
+        bits: List[str] = []
+        preset, _ = self._resolve_selected_style()
+        if not preset:
+            return bits
+        desc = (preset.get("style_prompt") or "").strip()
+        if desc:
+            bits.append("Style: " + desc)
+        palette = [c for c in (preset.get("palette") or []) if c][:4]
+        if palette:
+            bits.append("Style palette: " + ", ".join(palette))
+        return bits
+
+
+    def _current_style_snapshot(self) -> Dict[str, Any]:
+        preset, preset_name = self._resolve_selected_style()
+        if preset:
+            return {
+                "preset": preset,
+                "id": preset.get("id", ""),
+                "name": preset_name or preset.get("name", ""),
+            }
+        fallback_name = getattr(self, "selected_style_name", "") or getattr(self, "global_style", "")
+        return {"preset": None, "id": "", "name": fallback_name}
+
+
+    def _load_user_styles(self) -> None:
+        styles_list = []
+        if isinstance(self.world, dict):
+            raw = self.world.get("style_presets")
+            if isinstance(raw, list):
+                styles_list = raw
+        self._user_styles = styles_list
+
+        payload = _read_json_safely(_styles_store_path())
+        if isinstance(payload, dict):
+            source = payload.get("styles") or payload.get("style_presets") or []
+        elif isinstance(payload, list):
+            source = payload
+        else:
+            source = []
+
+        existing_by_id: Dict[str, Dict[str, Any]] = {}
+        for entry in self._user_styles:
+            if isinstance(entry, dict):
+                sid = (entry.get("id") or "").strip()
+                if sid:
+                    existing_by_id[sid] = entry
+
+        for entry in source:
+            if not isinstance(entry, dict):
+                continue
+            sid = (entry.get("id") or "").strip()
+            if sid and sid in existing_by_id:
+                try:
+                    existing_by_id[sid].update(entry)
+                except Exception:
+                    pass
+            else:
+                self._user_styles.append(entry)
+                if sid:
+                    existing_by_id[sid] = entry
+
+        if isinstance(self.world, dict):
+            self.world["style_presets"] = self._user_styles
+
+
+    def _save_user_styles(self) -> None:
+        try:
+            styles = [s for s in getattr(self, "_user_styles", []) if isinstance(s, dict)]
+            payload = {"styles": styles}
+            path = _styles_store_path()
+            ensure_dir(os.path.dirname(path) or ".")
+            _write_json_atomic(path, payload)
+        except Exception as exc:
+            try:
+                print(f"[style] warning: failed to save user styles: {exc}")
+            except Exception:
+                pass
+
+
+    def _merge_styles_for_dropdown(self) -> None:
+        try:
+            if not isinstance(self.world, dict):
+                return
+            styles = getattr(self, "_user_styles", None)
+            if styles is None:
+                styles = []
+            current = self.world.setdefault("style_presets", [])
+            if current is not styles:
+                self.world["style_presets"] = styles
+            self._refresh_style_dropdown(preserve_selection=False)
+        except Exception:
+            try:
+                self._refresh_style_dropdown(preserve_selection=False)
+            except Exception:
+                pass
+
+
+    def _load_thumb(self, path: str, max_side: int = 160):
+        """
+        Load a thumbnail ImageTk.PhotoImage, caching in self._thumb_cache.
+        Returns (imgtk, (w, h)) or (None, (0, 0)) on failure.
+        """
+        try:
+            if not hasattr(self, "_thumb_cache"):
+                self._thumb_cache = {}
+            key = (path, max_side)
+            cached = self._thumb_cache.get(key)
+            if cached:
+                return cached
+            with Image.open(path) as im:
+                im = im.convert("RGBA")
+                w, h = im.size
+                scale = max(1.0, max(w, h) / float(max_side))
+                tw = int(max(1, round(w / scale)))
+                th = int(max(1, round(h / scale)))
+                im = im.resize((tw, th), Image.LANCZOS)
+                imtk = ImageTk.PhotoImage(im)
+                cached = (imtk, (imtk.width(), imtk.height()))
+                self._thumb_cache[key] = cached
+                return cached
+        except Exception:
+            return None, (0, 0)
+
+    def _asset_path_by_id(self, asset_id: str) -> str:
+        """Resolve asset file path from world.assets_registry; return '' if not found."""
+        try:
+            reg = (self.world or {}).get("assets_registry") or []
+            for item in reg:
+                if isinstance(item, dict) and item.get("id") == asset_id:
+                    pth = item.get("path")
+                    return pth if isinstance(pth, str) else ""
+        except Exception:
+            return ""
+        return ""
+
+
+    def _find_profile_by_name(self, name: str, kind_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[Any]]:
+        target = (name or "").strip()
+        if not target:
+            return None, None
+
+        lowered = target.lower()
+        sanitized = sanitize_name(target)
+
+        def _match(pool: Dict[str, Any]) -> Optional[str]:
+            for nm in pool.keys():
+                if (nm or "").lower() == lowered:
+                    return nm
+            for nm in pool.keys():
+                if sanitize_name(nm) == sanitized:
+                    return nm
+            return None
+
+        order: List[str]
+        if kind_hint == "location":
+            order = ["location", "character"]
+        elif kind_hint == "character":
+            order = ["character", "location"]
+        else:
+            order = ["character", "location"]
+
+        for kind in order:
+            pool = self.characters if kind == "character" else self.locations
+            matched = _match(pool)
+            if matched:
+                return kind, pool.get(matched)
+
+        return None, None
+
+
+    def _drop_org_and_reconnect(self) -> bool:
+        try:
+            os.environ.pop("OPENAI_ORG_ID", None)
+            os.environ.pop("OPENAI_ORGANIZATION", None)
+        except Exception:
+            pass
+        try:
+            self.client = OpenAIClient(self.api_key)
+            return True
+        except Exception as e:
+            messagebox.showerror("OpenAI", "Reconnect without Organization failed:\n" + str(e))
+            return False
+
+    def aspect_to_size(self, aspect: str) -> str:
+        """
+        Map an aspect (21:9, 16:9, 3:2, 2:3, 1:1) to a legal OpenAI Images size.
+        Falls back to current self.image_size if the aspect is unrecognized.
+        """
+        return ASPECT_TO_SIZE.get((aspect or "").strip(), self.image_size)
+    
+    def _normalize_size(self, s: str) -> str:
+        """
+        Normalize user-visible size selections into an Images API-supported size.
+        Special-cases "auto" to honor the currently selected scene aspect.
+        """
+        allowed = {"1024x1024", "1536x1024", "1024x1536"}
+        s = (s or "").strip().lower()
+        if s in allowed:
+            return s
+        if s == "auto":
+            # Prefer an explicit aspect if available; otherwise keep our default.
+            asp = getattr(self, "scene_render_aspect", None) or DEFAULT_ASPECT
+            return self.aspect_to_size(asp)
+        # Salvage orientation if a freeform string like "800x1200" appears.
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", s)[:2]]
+            if len(nums) == 2:
+                w, h = nums
+                return "1536x1024" if w >= h else "1024x1536"
+
+        except Exception:
+            pass
+        return "1024x1024"
+
+    def _pick_supported_size(self, aspect: str, requested: str) -> str:
+        """
+        Return an Images API-supported size for the desired aspect.
+        Allowed: 1024x1024, 1536x1024, 1024x1536, or 'auto'.
+    
+        IMPORTANT: For scene renders we must ALWAYS honor the aspect selector.
+        Mapping:
+          • 21:9, 16:9, 3:2  -> 1536x1024 (wide)
+          • 2:3              -> 1024x1536 (tall)
+          • 1:1              -> 1024x1024 (square)
+        """
+        allowed = {"1024x1024", "1536x1024", "1024x1536", "auto"}
+        asp = (aspect or "").strip()
+        req = (requested or "").strip()
+    
+        # 1) Aspect mapping always wins when recognized
+        if asp in {"21:9", "16:9", "3:2"}:
+            return "1536x1024"
+        if asp in {"2:3", "9:16"}:
+            return "1024x1536"
+        if asp == "1:1":
+            return "1024x1024"
+    
+        # 2) Otherwise, respect an explicit valid size (non-auto)
+        if req in allowed and req != "auto":
+            return req
+    
+        # 3) Salvage orientation from any numeric hint in 'req'
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", req)[:2]]
+            if len(nums) == 2:
+                w, h = nums
+                return "1536x1024" if w >= h else "1024x1536"
+        except Exception:
+            pass
+    
+        # 4) Safe default
+        return "1024x1024"
+
+
+            filetypes=[("Style JSON", "*.style.json *.json"), ("All Files", "*.*")],
+
+    def _try_images_generate(
+        self,
+        prompt: str,
+        n: int,
+        size: str | None = None,
+        refs: list[str] | None = None,
+    ) -> list[bytes]:
+        """
+        Centralized image generation helper that guarantees a legal size is passed.
+        """
+        if not self.client:
+            self._on_connect()
+            if not self.client:
+                return []
+        # Normalize size (and resolve "auto" against the active aspect)
+        requested = size or self.image_size
+        target_size = self._normalize_size(requested)
+    
+        try:
+            prompt_for_api = self._augment_prompt_for_render(prompt)
+            if refs:
+                return self.client.generate_images_b64_with_refs(
+                    model=self.image_model,
+                    prompt=prompt_for_api,
+                    size=target_size,
+                    ref_data_uris=refs,
+                    n=n
+                )
+            return self.client.generate_images_b64(
+                model=self.image_model,
+                prompt=prompt_for_api,
+                size=target_size,
+                n=n
+            )
+        except Exception as e:
+            raise RuntimeError(f"Image generation failed ({target_size}): {e}") from e
+
+
+    def _current_exposure_settings(self) -> tuple[float, bool, float]:
+        try:
+            bias = float(getattr(self, "exposure_bias", EXPOSURE_BIAS))
+        except Exception:
+            bias = float(EXPOSURE_BIAS)
+        try:
+            post = bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP))
+        except Exception:
+            post = bool(EXPOSURE_POST_TONEMAP)
+        try:
+            emiss = float(getattr(self, "emissive_level", EMISSIVE_LEVEL))
+        except Exception:
+            emiss = float(EMISSIVE_LEVEL)
+        return bias, post, emiss
+
+    def _augment_prompt_for_render(self, prompt: str) -> str:
+        bias, _, emiss = self._current_exposure_settings()
+        try:
+            base = str(prompt or "")
+        except Exception:
+            base = ""
+        cleaned_lines: list[str] = []
+        for line in base.splitlines():
+            strip = line.strip().lower()
+            if strip.startswith("exposure control:") or strip.startswith("emissive lighting:"):
+                continue
+            cleaned_lines.append(line)
+        base_txt = "\n".join(cleaned_lines).strip()
+        parts: list[str] = [base_txt] if base_txt else []
+        parts.append("Exposure control: " + exposure_language(bias))
+        if abs(emiss) >= 0.15:
+            parts.append("Emissive lighting: " + emissive_language(emiss))
+        augmented = "\n".join(parts)
+        try:
+            print(f"[prompt] exposure={bias:+.2f} emissive={emiss:+.2f}")
+        except Exception:
+            pass
+        return augmented
+
+    def _process_generated_image(
+        self, raw: bytes, ext: str | None = None, *, need_image: bool = False
+    ) -> tuple[bytes, Optional["Image.Image"]]:
+        bias, post, _ = self._current_exposure_settings()
+        processed = raw
+        img_obj: Optional["Image.Image"] = None
+        log_msg = None
+        if post and abs(bias) >= 0.05:
+            try:
+                buf = io.BytesIO(raw)
+                with Image.open(buf) as im:
+                    im.load()
+                    tonemapped = apply_exposure_tonemap(im, bias)
+                    out_buf = io.BytesIO()
+                    fmt = None
+                    if ext:
+                        fmt = {
+                            ".png": "PNG",
+                            ".jpg": "JPEG",
+                            ".jpeg": "JPEG",
+                            ".webp": "WEBP",
+                        }.get(ext.lower())
+                    if not fmt:
+                        fmt = tonemapped.format or "PNG"
+                    save_img = tonemapped
+                    if fmt == "JPEG" and tonemapped.mode == "RGBA":
+                        save_img = tonemapped.convert("RGB")
+                    save_img.save(out_buf, format=fmt)
+                    processed = out_buf.getvalue()
+                    img_obj = tonemapped.copy()
+                    log_msg = f"[exposure] post tone-map applied (bias={bias:+.2f})"
+            except Exception as e:
+                log_msg = f"[exposure] tone-map skipped: {e}"
+                img_obj = None
+                processed = raw
+        if need_image and img_obj is None:
+            try:
+                buf = io.BytesIO(processed)
+                with Image.open(buf) as im:
+                    im.load()
+                    img_obj = im.copy()
+            except Exception:
+                img_obj = None
+        if log_msg:
+            try:
+                print(log_msg)
+
+            except Exception:
+                pass
+        return processed, img_obj
+
+    def _process_image_batch(self, imgs: list[bytes], ext: str | None = None) -> list[bytes]:
+        processed: list[bytes] = []
+        for b in imgs or []:
+            pb, _ = self._process_generated_image(b, ext=ext, need_image=False)
+            processed.append(pb)
+        return processed
+
+            try:
+                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
+            except Exception:
+
+    def _build_ui(self):
+        """
+        Build the main notebook, all tabs, and a bottom status bar that includes:
+          - Left: status text
+          - Right: per-run "Run est." budget line (tokens/images)
+        Also installs global mouse wheel handling.
+        """
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+        self.nb = nb
+
+        # Tabs
+        self._build_tab_settings()
+        self._build_tab_story()
+        self._build_tab_characters()
+        self._build_tab_locations()
+        self._build_tab_shots_export()
+        try:
+            self._build_tab_batch_run()
+        except Exception:
+            pass
+        # Bottom status + per-run budget line
+        bar = ttk.Frame(self.root)
+        bar.pack(side="bottom", fill="x")
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True, padx=(6, 6))
+
+        if LAST_EXPAND_SCENES_STATUS:
+            try:
+                self._set_status(LAST_EXPAND_SCENES_STATUS)
+            except Exception:
+                pass
+
+        # Initialize per-run budget line on the right
+        self._init_run_budget()
+        ttk.Label(bar, textvariable=self.budget_var, anchor="e").pack(side="right", padx=6)
+
+        # Global mouse wheel (so lists scroll without focusing them first)
+        try:
+            self._install_global_mousewheel()
+        except Exception:
+            pass
+    def _build_tab_batch_run(self):
+        t = ttk.Frame(self.nb)
+        self.nb.add(t, text="Batch (Stories)")
+        frm = ttk.Frame(t, padding=10)
+        frm.pack(fill="both", expand=True)
+    
+        # --- Directory pickers ---
+        self.batch_stories_dir  = tk.StringVar(value="")
+        self.batch_profiles_dir = tk.StringVar(value="")
+        self.batch_out_dir      = tk.StringVar(value="")
+        self.batch_aspect       = tk.StringVar(value=DEFAULT_ASPECT)
+        self.batch_policy       = tk.StringVar(value="final_prompt")
+        self.batch_render_n     = tk.StringVar(value="1")
+        self.batch_delay_s      = tk.StringVar(value="0")
+    
+        # NEW: coverage selector (min/max). Default: "min"
+        self.batch_coverage_mode = tk.StringVar(value="min")
+    
+        def _row(label, var):
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text=label, width=22).pack(side="left")
+            ent = ttk.Entry(row, textvariable=var, width=70)
+            ent.pack(side="left", fill="x", expand=True, padx=(6,6))
+            return row
+    
+        # Stories folder
+        r = _row("Stories folder (.txt)", self.batch_stories_dir)
+        ttk.Button(r, text="Choose…",
+                   command=lambda: self.batch_stories_dir.set(
+                       filedialog.askdirectory() or self.batch_stories_dir.get()
+                   )).pack(side="left")
+    
+        # Profiles repo (optional)
+        r = _row("Profiles repo folder", self.batch_profiles_dir)
+        ttk.Button(r, text="Choose…",
+                   command=lambda: self.batch_profiles_dir.set(
+                       filedialog.askdirectory() or self.batch_profiles_dir.get()
+                   )).pack(side="left")
+    
+        # Output root (per‑story subfolders will be created)
+        r = _row("Output root", self.batch_out_dir)
+        ttk.Button(r, text="Choose…",
+                   command=lambda: self.batch_out_dir.set(
+                       filedialog.askdirectory() or self.batch_out_dir.get()
+                   )).pack(side="left")
+    
+        # ---------- General options ----------
+        opt = ttk.Labelframe(frm, text="Options")
+        opt.pack(fill="x", pady=(8,6))
+    
+        r2 = ttk.Frame(opt); r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="Render aspect:").pack(side="left")
+        ttk.Combobox(r2, width=8, textvariable=self.batch_aspect,
+                     values=ASPECT_CHOICES, state="readonly").pack(side="left", padx=(6,12))
+        ttk.Label(r2, text="Prompt policy:").pack(side="left")
+        ttk.Combobox(r2, width=14, textvariable=self.batch_policy,
+                     values=["final_prompt","scene_fused","shot_prompt"], state="readonly").pack(side="left", padx=(6,12))
+        ttk.Label(r2, text="Renders per shot:").pack(side="left")
+        ttk.Entry(r2, width=4, textvariable=self.batch_render_n).pack(side="left", padx=(6,12))
+        ttk.Label(r2, text="Delay (s) between renders:").pack(side="left")
+        ttk.Entry(r2, width=4, textvariable=self.batch_delay_s).pack(side="left", padx=(6,12))
+        ttk.Label(r2, text="Min words / image:").pack(side="left")
+        self.batch_min_words_var = tk.StringVar(value=str(self.min_words_between_images))
+        ttk.Entry(r2, width=6, textvariable=self.batch_min_words_var).pack(side="left", padx=(6,12))
+        
+        # ---------- Final image coverage ----------
+        cov = ttk.Labelframe(frm, text="Final image coverage (shots per scene)")
+        cov.pack(fill="x", pady=(6,6))
+        rowc = ttk.Frame(cov); rowc.pack(fill="x", pady=(4,4))
+        ttk.Radiobutton(rowc, text="Minimum (1 image per scene)",
+                        variable=self.batch_coverage_mode, value="min").pack(side="left", padx=(4,8))
+        ttk.Radiobutton(rowc, text="Maximum (all shots per scene)",
+                        variable=self.batch_coverage_mode, value="max").pack(side="left", padx=(4,8))
+    
+        # ---------- Profiles — creation controls (used only when a profile is missing) ----------
+        prof = ttk.Labelframe(frm, text="Profiles to create when missing (repo-first matching is always attempted)")
+        prof.pack(fill="x", pady=(8,6))
+    
+        # Characters — views
+        rowc1 = ttk.Frame(prof); rowc1.pack(fill="x", pady=(2,2))
+        ttk.Label(rowc1, text="Character views:").pack(side="left")
+        self.batch_char_views_vars = {}
+    
+        def _add_c(vkey, label, default_checked):
+            var = tk.BooleanVar(value=default_checked)
+            ttk.Checkbutton(rowc1, text=label, variable=var).pack(side="left", padx=(4,2))
+            self.batch_char_views_vars[vkey] = var
+    
+        # Defaults: front + profile_left + profile_right checked
+        _add_c("front",              CHAR_SHEET_VIEWS_DEF["front"]["label"], True)
+        _add_c("three_quarter_left", CHAR_SHEET_VIEWS_DEF["three_quarter_left"]["label"], False)
+        _add_c("profile_left",       CHAR_SHEET_VIEWS_DEF["profile_left"]["label"], True)
+        _add_c("three_quarter_right",CHAR_SHEET_VIEWS_DEF["three_quarter_right"]["label"], False)
+        _add_c("profile_right",      CHAR_SHEET_VIEWS_DEF["profile_right"]["label"], True)
+        _add_c("back",               CHAR_SHEET_VIEWS_DEF["back"]["label"], False)
+        _add_c("full_body_tpose",    CHAR_SHEET_VIEWS_DEF["full_body_tpose"]["label"], False)
+    
+        rowc2 = ttk.Frame(prof); rowc2.pack(fill="x", pady=(2,6))
+        ttk.Label(rowc2, text="Images per char view:").pack(side="left")
+        self.batch_char_per_view_spin = ttk.Spinbox(rowc2, from_=1, to=3, width=4)
+        self.batch_char_per_view_spin.set("1")
+        self.batch_char_per_view_spin.pack(side="left", padx=(4,12))
+    
+        # Locations — views
+        rowl1 = ttk.Frame(prof); rowl1.pack(fill="x", pady=(2,2))
+        ttk.Label(rowl1, text="Location views:").pack(side="left")
+        self.batch_loc_views_vars = {}
+    
+        def _add_l(vkey, label, default_checked):
+            var = tk.BooleanVar(value=default_checked)
+            ttk.Checkbutton(rowl1, text=label, variable=var).pack(side="left", padx=(4,2))
+            self.batch_loc_views_vars[vkey] = var
+    
+        # Defaults: establishing + alt_angle checked
+        _add_l("establishing", LOC_VIEWS_DEF["establishing"]["label"], True)
+        _add_l("alt_angle",    LOC_VIEWS_DEF["alt_angle"]["label"],    True)
+        _add_l("detail",       LOC_VIEWS_DEF["detail"]["label"],       False)
+    
+        rowl2 = ttk.Frame(prof); rowl2.pack(fill="x", pady=(2,2))
+        ttk.Label(rowl2, text="Images per loc view:").pack(side="left")
+        self.batch_loc_per_view_spin = ttk.Spinbox(rowl2, from_=1, to=3, width=4)
+        self.batch_loc_per_view_spin.set("1")
+        self.batch_loc_per_view_spin.pack(side="left", padx=(4,12))
+    
+        # ---------- Run ----------
+        run_row = ttk.Frame(frm); run_row.pack(fill="x", pady=(10,0))
+        ttk.Button(run_row, text="Run Batch", command=self._on_run_batch_from_ui).pack(side="left")
+
+
+
+
+
+        buttons_row = ttk.Frame(left)
+        buttons_row.pack(fill="x", pady=(0, 6))
+        default_btn = ttk.Button(buttons_row, text="Set default")
+        default_btn.pack(side="left", padx=(0, 6))
+        rename_btn = ttk.Button(buttons_row, text="Rename")
+        rename_btn.pack(side="left", padx=(0, 6))
+        delete_btn = ttk.Button(buttons_row, text="Delete")
+        delete_btn.pack(side="left", padx=(0, 6))
 
     def _on_run_batch_from_ui(self):
         import os, threading
@@ -9662,6 +10793,7 @@ class App:
 
             try:
                 self._save_user_styles()
+
             except Exception:
                 pass
             try:
@@ -9795,6 +10927,7 @@ class App:
         ttk.Button(right, text="Add Folder…", command=_add_folder).grid(row=4, column=1, sticky="w", pady=(0, 6))
         ttk.Button(right, text="Clear", command=_clear_files).grid(row=4, column=2, sticky="w", pady=(0, 6))
 
+
         def _create_style():
             paths = list(dict.fromkeys(selected_samples))
             if len(paths) < 5:
@@ -9887,6 +11020,7 @@ class App:
                 messagebox.showwarning("Rename", "Enter a new name for the style.", parent=win)
                 return
             preset["name"] = new_name
+
             try:
                 self._save_user_styles()
             except Exception:
@@ -9898,6 +11032,7 @@ class App:
                 pass
             rebuild_list(select_id=preset.get("id"))
             self._refresh_style_dropdown(preserve_selection=False)
+
 
         def _delete_selected():
             selection = style_list.curselection()
@@ -9917,6 +11052,7 @@ class App:
             if self.selected_style_id == sid:
                 self.selected_style_id = ""
                 self.selected_style_name = self.global_style
+
             try:
                 self._save_user_styles()
             except Exception:
@@ -9928,6 +11064,7 @@ class App:
                 pass
             rebuild_list()
             self._refresh_style_dropdown(preserve_selection=False)
+
 
 
         # Refresh Story/Scenes tab UI
@@ -10240,6 +11377,7 @@ class App:
             except Exception:
                 print(f"[style] import failed: {exc}")
 
+
     def import_style_from_path(self, path: str) -> str:
         """
         Import a style preset from a .style.json or .json file and make it the default selection.
@@ -10415,123 +11553,41 @@ class App:
 
         # 2) If no selection yet, prefer default_style_id from world.json
         if not desired_display:
+
             try:
-                dsid = (self.world or {}).get("default_style_id") or ""
-                if dsid:
-                    desired_display = id_map.get(dsid)
-                    if desired_display:
-                        self.selected_style_id = dsid
+                self._merge_styles_for_dropdown()
+            except Exception:
+                self._refresh_style_dropdown(preserve_selection=True)
+
+            # Show it selected in the combobox
+            try:
+                combo = getattr(self, "style_combo", None)
+                # _build_style_combo_options() keeps a map id->display; use it if present
+                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
+                if combo and display:
+                    combo.set(display)
+                    # notify selection logic
+                    self._on_style_selected()
             except Exception:
                 pass
 
-        # 3) Next, prefer a previously selected style name when it’s builtin
-        if not desired_display and not self.selected_style_id and self.global_style:
-            info = mapping.get(self.global_style)
-            if info and info.get("kind") == "builtin":
-                desired_display = self.global_style
-
-        # 4) Otherwise pick the first non-separator item
-        if not desired_display:
-            for candidate in values:
-                info = mapping.get(candidate)
-                if info and info.get("kind") != "separator":
-                    desired_display = candidate
-                    break
-        if desired_display:
             try:
-                combo.set(desired_display)
+                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
             except Exception:
-                pass
-            self._apply_style_selection_from_display(desired_display, quiet=True)
-
-    def _on_style_selected(self, _event=None):
-        combo = getattr(self, "style_combo", None)
-        if combo is None:
-            return
-        current = combo.get().strip()
-        info = self._style_combo_mapping.get(current)
-        if info and info.get("kind") == "separator":
-            previous_display = None
-            if self.selected_style_id:
-                previous_display = self._style_display_by_id.get(self.selected_style_id)
-            if not previous_display:
-                previous_display = self.selected_style_name or self.global_style or GLOBAL_STYLE_DEFAULT
-            if previous_display:
-                try:
-                    combo.set(previous_display)
-                except Exception:
-                    pass
-                self._apply_style_selection_from_display(previous_display, quiet=True)
-            return
-        self._apply_style_selection_from_display(current, quiet=False)
-        self._refresh_style_dropdown(preserve_selection=True)
-
-    def _export_style_dialog(self):
-        if getattr(self, "root", None) is None:
-            print("[style] export not available in headless mode")
-            return
-        sel_id = (getattr(self, "selected_style_id", "") or "").strip()
-        target = None
-        for preset in getattr(self, "_user_styles", []) or []:
-            if isinstance(preset, dict) and (preset.get("id") or "").strip() == sel_id:
-                target = preset
-                break
-        if not target:
-            try:
-                messagebox.showinfo("Export Style", "Select a user style to export.")
-            except Exception:
-                print("[style] select a user style to export")
-            return
-
-        default_name = (target.get("name") or target.get("id") or "style").strip() or "style"
-        default_name = sanitize_name(default_name) or "style"
-        out_path = filedialog.asksaveasfilename(
-            title="Export Style",
-            defaultextension=".style.json",
-            initialfile=f"{default_name}.style.json",
-            filetypes=[("Style JSON", "*.style.json"), ("JSON", "*.json"), ("All Files", "*.*")],
-        )
-        if not out_path:
-            return
-
-        payload = _style_export_minimal_dict(target)
-        try:
-            ensure_dir(os.path.dirname(out_path) or ".")
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                print(f"[style] imported '{self.selected_style_name}'")
         except Exception as exc:
             try:
-                messagebox.showerror("Export failed", str(exc))
+                messagebox.showerror("Import failed", str(exc))
             except Exception:
-                print(f"[style] export failed: {exc}")
-            return
+                print(f"[style] import failed: {exc}")
 
+    def import_style_from_path(self, path: str) -> str:
+        """
+        Import a style preset from a .style.json or .json file and make it the default selection.
+        Returns the preset id, or '' on failure.
+        """
         try:
-            base = os.path.splitext(out_path)[0]
-            for idx, path in enumerate(_style_preview_paths(self, target), start=1):
-                thumb_path = f"{base}.preview{idx}.jpg"
-                _save_thumb(path, thumb_path, max_side=320)
-        except Exception:
-            pass
-
-        try:
-            messagebox.showinfo("Export Style", f"Exported '{target.get('name', '(unnamed)')}'.")
-        except Exception:
-            print(f"[style] exported '{target.get('name', '(unnamed)')}' → {out_path}")
-
-    def _import_style_dialog(self):
-        if getattr(self, "root", None) is None:
-            print("[style] import not available in headless mode")
-            return
-        in_path = filedialog.askopenfilename(
-            title="Import Style",
-            filetypes=[("Style JSON", "*.style.json *.json"), ("All Files", "*.*")],
-        )
-        if not in_path:
-            return
-
-        try:
-            data = _read_json_safely(in_path)
+            data = _read_json_safely(path)
             if not isinstance(data, dict):
                 raise ValueError("Not a JSON object")
             style = data.get("style") if isinstance(data.get("style"), dict) else data
@@ -10547,49 +11603,276 @@ class App:
                 style["id"] = sid
 
             user_styles = getattr(self, "_user_styles", []) or []
-            conflict_idx = -1
+            # Replace if id exists, else append
             for idx, preset in enumerate(user_styles):
                 if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    conflict_idx = idx
+                    user_styles[idx] = style
                     break
-
-            if conflict_idx >= 0:
-                try:
-                    replace = messagebox.askyesno(
-                        "Import Style",
-                        f"Style id '{sid}' already exists.\nYes = Replace, No = Keep both.",
-                    )
-                except Exception:
-                    replace = True
-                if replace:
-                    user_styles[conflict_idx] = style
-                else:
-                    sid = f"{sid}_dup{int(time.time())}"
-                    style["id"] = sid
-                    user_styles.append(style)
             else:
                 user_styles.append(style)
 
             self.selected_style_id = sid
             self.selected_style_name = style.get("name", "")
+            self.global_style = self.selected_style_name or self.global_style
+
+
             try:
                 self._save_user_styles()
             except Exception:
                 pass
-
             try:
                 if self.world_store_path:
-                    # persist default selection so the app doesn't revert to builtin on restart
-                    self.world["default_style_id"] = sid
                     self._save_world_store_to(self.world_store_path)
             except Exception:
                 pass
+            rebuild_list()
+            self._refresh_style_dropdown(preserve_selection=False)
 
-            # Rebuild dropdown and select this style
+        def _set_default_style():
+            selection = style_list.curselection()
+            if not selection:
+                return
+            label = style_list.get(selection[0])
+            preset = display_to_preset.get(label)
+            if not preset:
+                return
+            sid = preset.get("id") or ""
+            self.world["default_style_id"] = sid
             try:
-                self._merge_styles_for_dropdown()
+                if self.world_store_path:
+                    self._save_world_store_to(self.world_store_path)
             except Exception:
-                self._refresh_style_dropdown(preserve_selection=True)
+                pass
+            self.selected_style_id = sid
+            self.selected_style_name = preset.get("name", "")
+            if self.selected_style_name:
+                self.global_style = self.selected_style_name
+            rebuild_list(select_id=sid)
+            self._refresh_style_dropdown(preserve_selection=False)
+
+        rename_btn.configure(command=_rename_selected)
+        delete_btn.configure(command=_delete_selected)
+        default_btn.configure(command=_set_default_style)
+
+        rebuild_list(select_id=self.selected_style_id or (self.world or {}).get("default_style_id"))
+
+    def _build_tab_settings(self):
+        """
+        Settings tab:
+          - API + model selectors
+          - Default image size & global style
+          - Monthly usage snapshot (billing_var)
+          - Aspect pickers
+          - world.json path with: Choose…  Import…  Refresh  Open…  Import analysis…
+        """
+        t = ttk.Frame(self.nb); self.nb.add(t, text="Settings")
+        frm = ttk.Frame(t, padding=10); frm.pack(fill="both", expand=True)
+
+        # --- API / Models ---
+        ttk.Label(frm, text="OpenAI API key").grid(row=0, column=0, sticky="w")
+        self.api_entry = ttk.Entry(frm, width=60); self.api_entry.insert(0, getattr(self, "api_key", "") or "")
+        self.api_entry.grid(row=0, column=1, sticky="w", padx=6)
+
+        ttk.Label(frm, text="LLM model").grid(row=1, column=0, sticky="w")
+        self.llm_combo = ttk.Combobox(frm, values=LLM_MODEL_CHOICES, state="readonly")
+        self.llm_combo.set(self.llm_model); self.llm_combo.grid(row=1, column=1, sticky="w", padx=6)
+
+        ttk.Label(frm, text="Image model").grid(row=2, column=0, sticky="w")
+        self.img_combo = ttk.Combobox(frm, values=[OPENAI_IMAGE_MODEL], state="readonly")
+        self.img_combo.set(self.image_model); self.img_combo.grid(row=2, column=1, sticky="w", padx=6)
+
+        ttk.Label(frm, text="Default image size").grid(row=3, column=0, sticky="w")
+        self.size_combo = ttk.Combobox(frm, values=IMAGE_SIZE_CHOICES, state="readonly")
+        self.size_combo.set(self.image_size); self.size_combo.grid(row=3, column=1, sticky="w", padx=6)
+
+        ttk.Label(frm, text="Global style").grid(row=4, column=0, sticky="w")
+        self.style_combo = ttk.Combobox(frm, state="readonly")
+        self.style_combo.grid(row=4, column=1, sticky="we", padx=6)
+        self.style_combo.bind("<<ComboboxSelected>>", self._on_style_selected)
+        ttk.Button(frm, text="Manage Styles…", command=self._open_style_manager).grid(row=4, column=2, sticky="w", padx=(0,6))
+        ttk.Button(frm, text="Export Style…", command=self._export_style_dialog).grid(row=4, column=3, sticky="w", padx=(0,6))
+        ttk.Button(frm, text="Import Style…", command=self._import_style_dialog).grid(row=4, column=4, sticky="w", padx=(0,6))
+        self._refresh_style_dropdown(preserve_selection=False)
+
+        ttk.Button(frm, text="Connect", command=self._on_connect).grid(row=5, column=0, pady=(8,0))
+        frm.grid_columnconfigure(1, weight=1)
+        frm.grid_columnconfigure(2, weight=1)
+
+        # --- Monthly usage snapshot (shows after Connect) ---
+        self.billing_var = getattr(self, "billing_var", tk.StringVar(value="Usage: —"))
+        ttk.Label(frm, text="OpenAI usage (this month)").grid(row=6, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.billing_var).grid(row=6, column=1, sticky="w", padx=6)
+
+        # --- Aspects ---
+        ttk.Label(frm, text="Character ref aspect").grid(row=7, column=0, sticky="w")
+        char_ref_cmb = ttk.Combobox(frm, values=ASPECT_CHOICES, state="readonly", width=10)
+        char_ref_cmb.set(self.char_ref_aspect)
+        char_ref_cmb.grid(row=7, column=1, sticky="w", padx=6)
+        char_ref_cmb.bind("<<ComboboxSelected>>", lambda e: setattr(self, "char_ref_aspect", char_ref_cmb.get()))
+
+        ttk.Label(frm, text="Location ref aspect").grid(row=8, column=0, sticky="w")
+        loc_ref_cmb = ttk.Combobox(frm, values=ASPECT_CHOICES, state="readonly", width=10)
+        loc_ref_cmb.set(self.loc_ref_aspect)
+        loc_ref_cmb.grid(row=8, column=1, sticky="w", padx=6)
+        loc_ref_cmb.bind("<<ComboboxSelected>>", lambda e: setattr(self, "loc_ref_aspect", loc_ref_cmb.get()))
+
+        ttk.Label(frm, text="Scene render aspect").grid(row=9, column=0, sticky="w")
+        scene_cmb = ttk.Combobox(frm, values=ASPECT_CHOICES, state="readonly", width=10)
+        scene_cmb.set(self.scene_render_aspect)
+        scene_cmb.grid(row=9, column=1, sticky="w", padx=6)
+        scene_cmb.bind("<<ComboboxSelected>>", lambda e: setattr(self, "scene_render_aspect", scene_cmb.get()))
+
+        # --- world.json (persistent memory) ---
+        ttk.Label(frm, text="World store (world.json)").grid(row=10, column=0, sticky="w")
+        self.world_path_var = tk.StringVar(value=getattr(self, "world_store_path", "") or "")
+        path_row = ttk.Frame(frm); path_row.grid(row=10, column=1, sticky="we", padx=6)
+        ttk.Entry(path_row, textvariable=self.world_path_var, width=60).pack(side="left", fill="x", expand=True)
+        ttk.Button(path_row, text="Choose…", command=self._on_choose_world_store).pack(side="left", padx=(6,0))
+        ttk.Button(path_row, text="Import…", command=self._on_import_world_json).pack(side="left", padx=(6,0))
+        # “Refresh from world.json” re-applies baselines from current path
+        ttk.Button(path_row, text="Refresh", command=self._refresh_world_from_path).pack(side="left", padx=(6,0))
+        ttk.Button(path_row, text="Open…", command=self._open_world_dir).pack(side="left", padx=(6,0))
+        # Optional: import a prior _analysis.json to seed scenes/characters/locations
+        ttk.Button(path_row, text="Import analysis…", command=self._on_import_analysis_json).pack(side="left", padx=(6,0))
+
+        # ---- Exposure bias slider ----
+        ttk.Label(frm, text="Exposure bias (dark ↔ bright)").grid(row=11, column=0, sticky="w", padx=6, pady=(8,0))
+        self.exposure_bias_var = tk.DoubleVar(value=float(getattr(self, "exposure_bias", EXPOSURE_BIAS)))
+
+        def _on_exposure_change(_v=None):
+            try:
+                val = float(self.exposure_bias_var.get())
+            except Exception:
+                val = float(EXPOSURE_BIAS)
+            val = max(-1.0, min(1.0, val))
+            self.exposure_bias = val
+            globals()["EXPOSURE_BIAS"] = val
+            try:
+                self._set_status(f"Exposure bias {val:+.2f}")
+            except Exception:
+                pass
+
+        exposure_scale = ttk.Scale(frm, from_=-1.0, to=1.0, orient="horizontal",
+                                   variable=self.exposure_bias_var, command=_on_exposure_change)
+        exposure_scale.grid(row=11, column=1, sticky="we", padx=6, pady=(8,0))
+
+        # ---- Post tone-map toggle ----
+        ttk.Label(frm, text="Post tone-map").grid(row=12, column=0, sticky="w", padx=6)
+        self.post_tonemap_var = tk.BooleanVar(value=bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP)))
+
+        def _on_post_tonemap_toggle():
+            val = bool(self.post_tonemap_var.get())
+            self.post_tonemap = val
+            globals()["EXPOSURE_POST_TONEMAP"] = val
+
+        ttk.Checkbutton(frm, text="Apply after generation",
+                         variable=self.post_tonemap_var, command=_on_post_tonemap_toggle).grid(row=12, column=1, sticky="w", padx=6, pady=(4,0))
+
+        # ---- Emissive / glow slider ----
+        ttk.Label(frm, text="Emissive / glow").grid(row=13, column=0, sticky="w", padx=6)
+        self.emissive_level_var = tk.DoubleVar(value=float(getattr(self, "emissive_level", EMISSIVE_LEVEL)))
+
+        def _on_emissive_change(_v=None):
+            try:
+                val = float(self.emissive_level_var.get())
+            except Exception:
+                val = float(EMISSIVE_LEVEL)
+            val = max(-1.0, min(1.0, val))
+            self.emissive_level = val
+            globals()["EMISSIVE_LEVEL"] = val
+
+        emissive_scale = ttk.Scale(frm, from_=-1.0, to=1.0, orient="horizontal",
+                                   variable=self.emissive_level_var, command=_on_emissive_change)
+        emissive_scale.grid(row=13, column=1, sticky="we", padx=6, pady=(4,0))
+
+    def _build_tab_story(self):
+        t = ttk.Frame(self.nb); self.nb.add(t, text="Story & Scenes")
+        outer = ttk.Frame(t, padding=10); outer.pack(fill="both", expand=True)
+
+        left = ttk.Frame(outer); left.pack(side="left", fill="both", expand=True)
+        ttk.Label(left, text="Story text:").pack(anchor="w")
+        self.story_text = tk.Text(left, wrap="word", height=18)
+        self.story_text.pack(fill="both", expand=True, pady=6)
+        if TKDND_AVAILABLE:
+            self.story_text.drop_target_register(DND_FILES)
+            self.story_text.dnd_bind("<<Drop>>", self._on_drop_story)
+
+        row = ttk.Frame(left); row.pack(fill="x")
+        ttk.Button(row, text="Load .txt...", command=self._on_load_story).pack(side="left")
+        ttk.Button(row, text="Analyze Story", command=self._on_analyze_story).pack(side="left", padx=8)
+        self.save_dialogue_btn = ttk.Button(row, text="Save Dialogue Files…", command=self._on_save_dialogue_files)
+        self.save_dialogue_btn.state(["disabled"])
+        self.save_dialogue_btn.pack(side="left")
+        
+        self._set_dialogue_save_enabled(False)
+
+        right = ttk.Frame(outer); right.pack(side="left", fill="both", expand=True, padx=10)
+
+        prec_lf = ttk.Labelframe(right, text="Story précis")
+        prec_lf.pack(fill="x", padx=0, pady=(0,6))
+        self.precis_text = tk.Text(prec_lf, height=6, wrap="word")
+        self.precis_text.configure(state="disabled")
+        self.precis_text.pack(fill="x", padx=6, pady=6)
+
+        cols = ("id","movement","title","location","time","tone","characters","what")
+        self.scene_tree = ttk.Treeview(right, columns=cols, show="headings", height=12, selectmode="browse")
+        for c, w in [("id",60),("movement", 90),("title",220),("location",160),("time",90),("tone",120),("characters",240),("what",360)]:
+            self.scene_tree.heading(c, text=("Movement" if c=="movement" else ("What happens" if c=="what" else c.title())))
+            self.scene_tree.column(c, width=w, anchor="w")
+        self.scene_tree.pack(fill="both", expand=True, pady=(0,6))
+
+        mov_lf = ttk.Labelframe(right, text="Movements")
+        mov_lf.pack(fill="both", expand=False)
+        mov_cols = ("id","name","span","focus","emotional","stakes")
+        self.mov_tree = ttk.Treeview(mov_lf, columns=mov_cols, show="headings", height=6, selectmode="browse")
+        for c, w in [("id",60),("name",200),("span",120),("focus",260),("emotional",220),("stakes",220)]:
+            self.mov_tree.heading(c, text=c.title())
+            self.mov_tree.column(c, width=w, anchor="w")
+        self.mov_tree.pack(fill="both", expand=True, padx=0, pady=0)
+
+        split_lf = ttk.Labelframe(right, text="Refine / Split scenes")
+        split_lf.pack(fill="x", padx=0, pady=(8,0))
+        ttk.Button(split_lf, text="Split by movement beat", command=self._on_split_by_movement).pack(side="left", padx=4, pady=6)
+        ttk.Button(split_lf, text="Split by location change", command=self._on_split_by_location_change).pack(side="left", padx=4, pady=6)
+        ttk.Button(split_lf, text="Split by character intro", command=self._on_split_by_character_intro).pack(side="left", padx=4, pady=6)
+        ttk.Button(split_lf, text="Undo last split", command=self._on_undo_split).pack(side="left", padx=10, pady=6)
+
+    def _set_status(self, msg: str):
+        self.status.set(msg)
+
+    def _set_dialogue_save_enabled(self, enabled: bool) -> None:
+        btn = getattr(self, "save_dialogue_btn", None)
+        if not btn:
+            return
+        try:
+            if enabled:
+                btn.state(["!disabled"])
+            else:
+                btn.state(["disabled"])
+        except Exception:
+            try:
+                btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
+            except Exception:
+                pass
+            rebuild_list(select_id=preset.get("id"))
+            self._refresh_style_dropdown(preserve_selection=False)
+
+    def _on_drop_story(self, event):
+        paths = self.root.splitlist(event.data)
+        for p in paths:
+            if os.path.isfile(p) and p.lower().endswith(".txt"):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    data = f.read()
+                self.story_text.delete("1.0","end")
+                self.story_text.insert("1.0", data)
+                self._last_story_text = data
+                self.input_text_path = p
+                self._last_story_path = p
+                self._set_status("Loaded: " + os.path.basename(p))
+                self._set_dialogue_save_enabled(False)
+                break
+
 
             # Show it selected in the combobox
             try:
@@ -11640,6 +12923,7 @@ class App:
             thumb_label = ttk.Label(ref_frame, text="", width=32)
             thumb_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(0,4))
 
+
             def _char_add_files(nm=name):
                 c_obj = self.characters.get(nm)
                 if not c_obj:
@@ -11781,6 +13065,7 @@ class App:
             txt = c.sheet_base_prompt or default_baseline_prompt(c)
         c.sheet_base_prompt = txt
         return txt
+
 
     def _on_propose_char_baseline(self, name: str):
         if not self.client:
@@ -12149,6 +13434,7 @@ class App:
         if not self.client:
             self._on_connect()
             if not self.client: return
+
         todo = [n for n, p in self.char_panels.items() if p["select_var"].get()]
         if not todo:
             messagebox.showinfo("Characters", "Tick at least one character.")
@@ -12232,6 +13518,7 @@ class App:
             thumb_canvas.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(8,4), pady=4)
             thumb_label = ttk.Label(ref_frame, text="", width=32)
             thumb_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(0,4))
+
 
             def _loc_add_files(nm=name):
                 loc = self.locations.get(nm)
@@ -13459,6 +14746,7 @@ class App:
             # Never let extras fail due to variant selection
             return "alternate angle — change lensing or camera height"
 
+
         except Exception:
             # Never let extras fail due to variant selection
             return "alternate angle — change lensing or camera height"
@@ -13501,6 +14789,7 @@ class App:
             f"{continuity_clause} "
             f"Avoid brand names; no text, no watermark. Aspect {aspect}."
         ).strip()
+
 
 
     def _analysis_for_export(self) -> dict:
@@ -13649,6 +14938,7 @@ class App:
         if not story_text:
             story_text = ""
 
+
         known_chars = getattr(self, "_dialogue_last_known_characters", [])
         alias_map = getattr(self, "_dialogue_last_aliases", {})
         utterances = copy.deepcopy(getattr(self, "_dialogue_last_utterances", []))
@@ -13701,6 +14991,7 @@ class App:
         )
         self._dialogue_last_metadata = copy.deepcopy(utterances)
         return {"json": result["json_path"], "marked": result["txt_path"]}
+
 
 
     def _inject_extra_scenes_by_word_gap(self, min_words: int) -> int:
@@ -14333,10 +15624,12 @@ class App:
         except Exception as exc:
             print(f"[DIALOGUE] analysis/emit failed: {exc}")
 
+
         if errors:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
         else:
             messagebox.showinfo("Export", "Export completed to:\n" + outdir)
+
 
 
 
