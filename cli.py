@@ -82,6 +82,9 @@ def _command_dialogue_extract(args: argparse.Namespace) -> int:
         llm_conf_threshold=float(args.llm_threshold),
         llm_batch_size=int(args.llm_batch),
         max_narrator_chars=(None if args.max_narrator is None else int(args.max_narrator)),
+        story_analysis=None,
+        llm_scene_bias=bool(getattr(args, "llm_scene_bias", True)),
+        llm_image_bias=bool(getattr(args, "llm_image_bias", True)),
     )
     LOGGER.info("Dialogue sidecars written:")
     LOGGER.info("  %s", result["txt_path"])
@@ -160,8 +163,23 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--ct", dest="confidence_threshold", default=0.90, type=float)
     extract_parser.add_argument("--max-narrator", dest="max_narrator", type=int)
     extract_parser.add_argument("--llm-assist", action="store_true", dest="llm_assist")
-    extract_parser.add_argument("--llm-threshold", dest="llm_threshold", default=0.92, type=float)
+    extract_parser.add_argument("--llm-threshold", dest="llm_threshold", default=0.83, type=float)
     extract_parser.add_argument("--llm-batch", dest="llm_batch", default=8, type=int)
+    extract_parser.add_argument(
+        "--no-llm-scene-bias",
+        dest="llm_scene_bias",
+        action="store_false",
+        help="disable scene roster hints during the LLM pass",
+        default=True,
+    )
+    extract_parser.add_argument(
+        "--no-llm-image-bias",
+        dest="llm_image_bias",
+        action="store_false",
+        help="disable image-derived hints during the LLM pass",
+        default=True,
+    )
+
     extract_parser.set_defaults(func=_command_dialogue_extract)
 
     scenes_parser = subparsers.add_parser("scenes", help="Scene tools")

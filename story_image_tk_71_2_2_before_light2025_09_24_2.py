@@ -29,6 +29,8 @@ import shutil
 import glob
 import math
 import statistics
+from collections import defaultdict
+
 import bisect
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -153,6 +155,7 @@ def _segment_lines(text: str) -> List[str]:
 # -------------------------------------------------------------
 # Hybrid dialogue extraction & attribution (rule-first, LLM optional)
 # -------------------------------------------------------------
+
 
 def _now_utc() -> int:
     return int(time.time())
@@ -469,12 +472,19 @@ class DialogueExtractor:
         utterances = self._interleave_narrator(self._text, speeches, self._line_starts)
         self._attribute_all(self._text, utterances)
         self._fuse_narrator_cues(self._text, utterances)
-        if self.mode == "permissive":
+        speech_only = [u for u in utterances if u.get("character") != "Narrator"]
+        unattributed_ratio = 0.0
+        if speech_only:
+            unattributed = sum(1 for u in speech_only if u.get("character") == "UNATTRIBUTED")
+            unattributed_ratio = unattributed / len(speech_only)
+        if self.mode == "permissive" or unattributed_ratio >= 0.5:
             self._apply_permissive_rules(self._text, utterances)
         self._enforce_closed_set(utterances)
         if isinstance(self.max_narrator, int):
             utterances = self._wrap_narrator_spans(utterances)
         for idx, utterance in enumerate(utterances, start=1):
+            if "_speech_type" in utterance and "speech_type" not in utterance:
+                utterance["speech_type"] = utterance.get("_speech_type")
             utterance["utterance_id"] = f"dlg_{idx:06d}"
         for utterance in utterances:
             utterance.pop("_speech_type", None)
@@ -829,7 +839,16 @@ class DialogueExtractor:
                 }
 
     def _wrap_narrator_spans(self, utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not isinstance(self.max_narrator, int) or self.max_narrator <= 0:
+        max_chars: Optional[int]
+        if isinstance(self.max_narrator, int) and self.max_narrator > 0:
+            max_chars = self.max_narrator
+        else:
+            speech_total = sum(1 for u in utterances if u.get("character") != "Narrator")
+            unattributed_total = sum(1 for u in utterances if u.get("character") == "UNATTRIBUTED")
+            max_chars = None
+            if speech_total and unattributed_total / max(1, speech_total) >= 0.5:
+                max_chars = 220
+        if not isinstance(max_chars, int) or max_chars <= 0:
             return utterances
         wrapped: List[Dict[str, Any]] = []
         sentence_pattern = re.compile(r".+?(?:[\.\!\?][\"”’']?\s+|$)", re.DOTALL)
@@ -838,7 +857,7 @@ class DialogueExtractor:
                 wrapped.append(utterance)
                 continue
             text_span = self._text[utterance["char_span"][0] : utterance["char_span"][1]]
-            if len(self._clean_line(text_span)) <= self.max_narrator:
+            if len(self._clean_line(text_span)) <= max_chars:
                 wrapped.append(utterance)
                 continue
             start_offset = utterance["char_span"][0]
@@ -851,7 +870,7 @@ class DialogueExtractor:
                 else:
                     last_start, last_end = accumulator[-1]
                     candidate_length = len(self._clean_line(text_span[last_start:seg_end]))
-                    if candidate_length <= self.max_narrator:
+                    if candidate_length <= max_chars:
                         accumulator[-1] = (last_start, seg_end)
                     else:
                         accumulator.append((seg_start, seg_end))
@@ -888,10 +907,10 @@ class LLMAssistedAttributor:
         aliases: Optional[Dict[str, List[str]]],
         conf_threshold: float = 0.92,
         batch_size: int = 8,
-
         model: Optional[str] = None,
         client: Optional["OpenAIClient"] = None,
-
+        scene_rosters: Optional[Dict[str, List[str]]] = None,
+        image_priors: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> None:
         self.known = known_characters or []
         self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
@@ -903,6 +922,8 @@ class LLMAssistedAttributor:
             self.model = os.environ.get("DIALOGUE_LLM_MODEL", DEFAULT_LLM_MODEL)
         self.client = client
         self._client_error = False
+        self.scene_rosters = scene_rosters or {}
+        self.image_priors = image_priors or {}
 
     def propose(self, full_text: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not candidates or self._client_error:
@@ -919,25 +940,30 @@ class LLMAssistedAttributor:
                 self._client_error = True
                 return []
             self.client = client
+
         allowed = [name for name in self.known if isinstance(name, str) and name.strip()]
+        if not allowed:
+            allowed = sorted({_title_case_name(name) for name in self.aliases.keys()})
         allowed = list(dict.fromkeys(allowed))
+
         alias_payload: Dict[str, List[str]] = {}
         for name in allowed:
             raw_aliases = sorted(a for a in self.aliases.get(name, set()) if isinstance(a, str) and a.strip())
             if raw_aliases:
                 alias_payload[name] = raw_aliases
-        outputs: List[Dict[str, Any]] = []
+
         system_prompt = (
-            "You are a dialogue analyst. Attribute quoted speech in prose. Only use characters from this provided list. "
-            "Return a JSON object with a 'results' array; each item must include utterance_id, character, confidence, and "
-            "evidence with optional name_span and verb_span (absolute indices)."
+            "You are a dialogue analyst. Given quoted speech or narrator cues, choose the speaker from the closed list only. "
+            "Favor verbs + names near the quote, consider scene/image hints as soft priors, and output JSON with fields: "
+            "utterance_id, character, confidence, evidence (rationale, name_span, verb_span, scene_bias_used, image_bias_used, notes)."
         )
+
+        outputs: List[Dict[str, Any]] = []
         step = self.batch_size or 1
         for start in range(0, len(candidates), step):
             chunk = candidates[start : start + step]
             payload_items = []
             for item in chunk:
-                uid = item.get("utterance_id")
                 span = item.get("char_span") or [0, 0]
                 ctx_span = item.get("context_span") or span
                 try:
@@ -951,11 +977,16 @@ class LLMAssistedAttributor:
                 ce = max(cs, min(ce, len(full_text)))
                 payload_items.append(
                     {
-                        "utterance_id": uid,
-                        "char_span": [s, e],
-                        "context_span": [cs, ce],
-                        "quote": full_text[s:e],
+                        "utterance_id": item.get("utterance_id"),
+                        "phase": item.get("phase"),
+                        "quote": item.get("line") or full_text[s:e],
                         "context": full_text[cs:ce],
+                        "char_span": [s, e],
+                        "scene_id": item.get("scene_id"),
+                        "scene_characters": item.get("scene_characters") or self.scene_rosters.get(item.get("scene_id"), []),
+                        "image_priors": item.get("image_priors") or self.image_priors.get(item.get("scene_id"), {}),
+                        "deterministic_score": item.get("deterministic_score"),
+                        "deterministic_character": item.get("deterministic_character"),
                     }
                 )
             if not payload_items:
@@ -1001,20 +1032,24 @@ class LLMAssistedAttributor:
                     conf_val = float(confidence)
                 except Exception:
                     continue
+                conf_val = _clamp01(conf_val)
                 if conf_val < self.conf_threshold:
                     continue
                 if character != "UNATTRIBUTED" and character not in allowed:
                     continue
-                evidence = {}
+                evidence: Dict[str, Any] = {}
                 raw_evidence = record.get("evidence") or {}
                 if isinstance(raw_evidence, dict):
-                    for key in ("name_span", "verb_span"):
-                        span_val = raw_evidence.get(key)
-                        if isinstance(span_val, (list, tuple)) and len(span_val) == 2:
-                            try:
-                                evidence[key] = [int(span_val[0]), int(span_val[1])]
-                            except Exception:
-                                continue
+                    for key in ("name_span", "verb_span", "rationale", "scene_bias_used", "image_bias_used", "notes"):
+                        value = raw_evidence.get(key)
+                        if key in {"name_span", "verb_span"}:
+                            if isinstance(value, (list, tuple)) and len(value) == 2:
+                                try:
+                                    evidence[key] = [int(value[0]), int(value[1])]
+                                except Exception:
+                                    continue
+                        else:
+                            evidence[key] = value
                 outputs.append(
                     {
                         "utterance_id": uid,
@@ -1035,24 +1070,114 @@ def _apply_llm_assist(
     batch_size: int,
     llm_model: Optional[str] = None,
     client: Optional["OpenAIClient"] = None,
-) -> None:
-    pending: List[Dict[str, Any]] = []
-    for utterance in utterances:
-        if utterance.get("character") != "UNATTRIBUTED":
+    story_analysis: Optional[Dict[str, Any]] = None,
+    llm_scene_bias: bool = True,
+    llm_image_bias: bool = True,
+) -> Dict[str, Any]:
+    stats = {
+        "attempted": 0,
+        "accepted": 0,
+        "mean_confidence": 0.0,
+        "by_character": {"before": {}, "after": {}},
+        "details": [],
+    }
+    before_counter: Dict[str, int] = defaultdict(int)
+    for item in utterances:
+        before_counter[item.get("character") or "UNATTRIBUTED"] += 1
+    stats["by_character"]["before"] = dict(before_counter)
+
+    analysis_payload = story_analysis
+    if analysis_payload is None and hasattr(client, "analysis"):
+        analysis_payload = getattr(client, "analysis")
+    scene_rosters, scene_ranges, image_priors = _derive_scene_context(
+        analysis_payload,
+        known_characters,
+    )
+
+    alias_lookup: Dict[str, str] = {}
+    for name in known_characters or []:
+        if isinstance(name, str):
+            alias_lookup[name.lower()] = name
+    for base, vals in (aliases or {}).items():
+        if not isinstance(base, str):
             continue
-        start, end = utterance["char_span"]
+        canonical = _title_case_name(base)
+        if canonical.lower() not in alias_lookup:
+            alias_lookup[canonical.lower()] = canonical
+        for alias in vals or []:
+            if isinstance(alias, str):
+                alias_lookup.setdefault(alias.lower(), canonical)
+
+    candidates: List[Dict[str, Any]] = []
+    candidate_lookup: Dict[str, Dict[str, Any]] = {}
+    verb_alt = r"(?:" + "|".join(sorted(map(re.escape, DialogueExtractor.DIALOGUE_VERBS))) + r")"
+    verb_re = re.compile(verb_alt, re.IGNORECASE)
+    narrator_trigger = re.compile(r"\b(?:said|asked|replied|whispered|shouted|murmured|rasped|called|told)\b", re.IGNORECASE)
+
+    for utterance in utterances:
+        start, end = utterance.get("char_span", (0, 0))
+        scene_id = _assign_scene_id_for_span((start, end), scene_ranges)
+        roster = scene_rosters.get(scene_id, []) if llm_scene_bias else []
+        priors = image_priors.get(scene_id or "", {}) if llm_image_bias else {}
         context_start = max(0, start - 240)
         context_end = min(len(full_text), end + 240)
-        pending.append(
-            {
-                "utterance_id": utterance["utterance_id"],
-                "char_span": [start, end],
-                "line": utterance["line"],
-                "context_span": [context_start, context_end],
+        base_candidate = {
+            "char_span": [start, end],
+            "context_span": [context_start, context_end],
+            "scene_id": scene_id,
+            "scene_characters": roster,
+            "image_priors": priors,
+            "deterministic_score": float((utterance.get("attribution") or {}).get("score") or 0.0),
+            "deterministic_character": utterance.get("character"),
+        }
+        speech_type = utterance.get("speech_type")
+        if utterance.get("character") == "UNATTRIBUTED" and speech_type in {"quote", "emdash", "script"}:
+            candidate_id = utterance["utterance_id"]
+            payload = dict(base_candidate)
+            payload.update(
+                {
+                    "utterance_id": candidate_id,
+                    "phase": "speech",
+                    "line": utterance.get("line"),
+                }
+            )
+            candidates.append(payload)
+            candidate_lookup[candidate_id] = {
+                "utterance": utterance,
+                "span": (start, end),
+                "phase": "speech",
             }
-        )
-    if not pending:
-        return
+            continue
+        if utterance.get("character") == "Narrator":
+            text = utterance.get("line") or ""
+            if not text.strip():
+                continue
+            if len(text) > 240 or narrator_trigger.search(text) or any(ch in text for ch in ('"', "“", "”")):
+                candidate_id = f"{utterance['utterance_id']}|nar"
+                segments = _split_narration_for_llm(full_text, (start, end), 240)
+                seg_start, seg_end = segments[0] if segments else (start, end)
+                payload = dict(base_candidate)
+                payload["char_span"] = [seg_start, seg_end]
+                payload["context_span"] = [max(0, seg_start - 240), min(len(full_text), seg_end + 240)]
+                payload.update(
+                    {
+                        "utterance_id": candidate_id,
+                        "phase": "narration",
+                        "line": text,
+                    }
+                )
+                candidates.append(payload)
+                candidate_lookup[candidate_id] = {
+                    "utterance": utterance,
+                    "span": (seg_start, seg_end),
+                    "phase": "narration",
+                }
+
+    if not candidates:
+        stats["by_character"]["after"] = dict(before_counter)
+        return stats
+
+    stats["attempted"] = len(candidates)
     agent = LLMAssistedAttributor(
         known_characters,
         aliases,
@@ -1060,22 +1185,28 @@ def _apply_llm_assist(
         batch_size=batch_size,
         model=llm_model,
         client=client,
+        scene_rosters=scene_rosters if llm_scene_bias else {},
+        image_priors=image_priors if llm_image_bias else {},
     )
-
-    proposals = agent.propose(full_text, pending) or []
-    id_map = {u["utterance_id"]: u for u in utterances}
+    proposals = agent.propose(full_text, candidates) or []
     name_re = re.compile(DialogueExtractor.NAME_RE)
-    verb_re = re.compile(r"(?:" + "|".join(sorted(map(re.escape, DialogueExtractor.DIALOGUE_VERBS))) + r")", re.IGNORECASE)
+    accepted_scores: List[float] = []
+
     for proposal in proposals:
-        uid = proposal.get("utterance_id")
-        if not uid or uid not in id_map:
+        candidate_id = proposal.get("utterance_id")
+        if not candidate_id or candidate_id not in candidate_lookup:
             continue
-        utterance = id_map[uid]
+        mapping = candidate_lookup[candidate_id]
+        utterance = mapping["utterance"]
+        base_uid = utterance["utterance_id"]
         character = proposal.get("character")
-        confidence = float(proposal.get("confidence") or 0.0)
-        if confidence < llm_conf_threshold or not isinstance(character, str):
+        if not isinstance(character, str):
             continue
-        if character != "UNATTRIBUTED" and known_characters and character not in known_characters:
+        confidence = float(proposal.get("confidence") or 0.0)
+        if confidence < llm_conf_threshold:
+            continue
+        canonical = alias_lookup.get(character.lower(), character)
+        if canonical != "UNATTRIBUTED" and known_characters and canonical not in known_characters:
             continue
         evidence = proposal.get("evidence") or {}
         valid = True
@@ -1091,26 +1222,107 @@ def _apply_llm_assist(
             if span_start < 0 or span_end > len(full_text) or span_start >= span_end:
                 valid = False
                 break
-            if min(abs(span_start - utterance["char_span"][0]), abs(span_end - utterance["char_span"][1])) > 120:
+            if min(abs(span_start - mapping["span"][0]), abs(span_end - mapping["span"][1])) > 160:
                 valid = False
                 break
             snippet = full_text[span_start:span_end]
-            if not regex.search(snippet):
-                valid = False
-                break
+            if regex is name_re:
+                if not regex.search(snippet):
+                    valid = False
+                    break
+            else:
+                if not regex.search(snippet):
+                    valid = False
+                    break
         if not valid:
             continue
-        current_score = float(utterance["attribution"].get("score") or 0.0)
+        current_score = float((utterance.get("attribution") or {}).get("score") or 0.0)
         if utterance.get("character") not in {"UNATTRIBUTED", "Narrator"} and confidence < current_score + 0.05:
             continue
-        utterance["character"] = character
+        utterance["character"] = canonical
+        evidence_payload = {
+            "rationale": evidence.get("rationale"),
+            "name_span": evidence.get("name_span"),
+            "verb_span": evidence.get("verb_span"),
+            "scene_bias_used": evidence.get("scene_bias_used"),
+            "image_bias_used": evidence.get("image_bias_used"),
+            "notes": evidence.get("notes"),
+        }
         utterance["attribution"] = {
             "method": "llm_verified",
             "score": confidence,
-            "evidence": json.dumps(evidence, ensure_ascii=False),
-            "name_candidate": character if character != "UNATTRIBUTED" else None,
+            "evidence": evidence_payload,
+            "name_candidate": canonical if canonical != "UNATTRIBUTED" else None,
         }
+        accepted_scores.append(confidence)
+        stats["accepted"] += 1
+        stats["details"].append(
+            {
+                "utterance_id": base_uid,
+                "assigned": canonical,
+                "confidence": confidence,
+                "phase": mapping["phase"],
+            }
+        )
+
+    if accepted_scores:
+        stats["mean_confidence"] = sum(accepted_scores) / len(accepted_scores)
+
+    _apply_llm_alternation(utterances)
     _enforce_closed_set_after_llm(utterances, known_characters, aliases)
+
+    after_counter: Dict[str, int] = defaultdict(int)
+    for item in utterances:
+        after_counter[item.get("character") or "UNATTRIBUTED"] += 1
+    stats["by_character"]["after"] = dict(after_counter)
+    return stats
+
+
+def _apply_llm_alternation(utterances: List[Dict[str, Any]]) -> None:
+    block: List[Dict[str, Any]] = []
+
+    def _resolve(segment: List[Dict[str, Any]]) -> None:
+        if len(segment) < 3:
+            return
+        for idx in range(len(segment) - 1):
+            left = segment[idx]
+            right = segment[idx + 1]
+            if (
+                left.get("character")
+                and right.get("character")
+                and left["character"] not in {"Narrator", "UNATTRIBUTED"}
+                and right["character"] not in {"Narrator", "UNATTRIBUTED"}
+                and left["character"] != right["character"]
+            ):
+                lscore = float((left.get("attribution") or {}).get("score") or 0.0)
+                rscore = float((right.get("attribution") or {}).get("score") or 0.0)
+                if lscore < 0.85 or rscore < 0.85:
+                    continue
+                speakers = [left["character"], right["character"]]
+                expected_index = 0
+                for follow in segment[idx + 2 :]:
+                    if follow.get("character") == "UNATTRIBUTED":
+                        expected = speakers[expected_index % 2]
+                        follow["character"] = expected
+                        follow["attribution"] = {
+                            "method": "alternation_llm",
+                            "score": 0.85,
+                            "evidence": f"alternation:{speakers[0]}/{speakers[1]}",
+                            "name_candidate": expected,
+                        }
+                        expected_index += 1
+                    else:
+                        break
+                break
+
+    for utterance in utterances:
+        if utterance.get("character") == "Narrator":
+            _resolve(block)
+            block = []
+        else:
+            block.append(utterance)
+    if block:
+        _resolve(block)
 
 
 def _enforce_closed_set_after_llm(
@@ -1152,6 +1364,183 @@ def _enforce_closed_set_after_llm(
             utterance["character"] = canonical
 
 
+def _scene_span_from_entry(scene: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    candidates = []
+    for key in ("char_span", "span", "text_span", "range"):
+        value = scene.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            try:
+                start = int(value[0])
+                end = int(value[1])
+            except Exception:
+                continue
+            candidates.append((start, end))
+        elif isinstance(value, dict):
+            start = value.get("start") or value.get("begin") or value.get("from")
+            end = value.get("end") or value.get("stop") or value.get("to")
+            if start is None or end is None:
+                continue
+            try:
+                candidates.append((int(start), int(end)))
+            except Exception:
+                continue
+    if not candidates:
+        start = scene.get("char_start") or scene.get("start_char")
+        end = scene.get("char_end") or scene.get("end_char")
+        if start is not None and end is not None:
+            try:
+                return (int(start), int(end))
+            except Exception:
+                return None
+        return None
+    best = min(candidates, key=lambda se: se[0])
+    return best
+
+
+def _derive_scene_context(
+    analysis: Optional[Dict[str, Any]],
+    known_characters: Optional[List[str]] = None,
+) -> Tuple[Dict[str, List[str]], List[Tuple[str, int, int]], Dict[str, Dict[str, float]]]:
+    if not isinstance(analysis, dict):
+        return {}, [], {}
+    known_set = {name for name in (known_characters or []) if isinstance(name, str)}
+    scene_rosters: Dict[str, List[str]] = {}
+    scene_ranges: List[Tuple[str, int, int]] = []
+    scenes = analysis.get("scenes")
+    if not isinstance(scenes, list):
+        scenes = []
+    for idx, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            continue
+        scene_id = scene.get("id") or scene.get("scene_id") or f"S{idx+1}"
+        roster: List[str] = []
+        chars = scene.get("characters_present") or scene.get("characters")
+        if isinstance(chars, list):
+            for char in chars:
+                if not isinstance(char, str):
+                    continue
+                clean = _title_case_name(char)
+                if known_set and clean not in known_set:
+                    continue
+                if clean not in roster:
+                    roster.append(clean)
+        scene_rosters[scene_id] = roster
+        span = _scene_span_from_entry(scene)
+        if span:
+            scene_ranges.append((scene_id, span[0], span[1]))
+    image_priors = _compute_scene_image_priors(scenes, known_set or None)
+    return scene_rosters, scene_ranges, image_priors
+
+
+def _compute_scene_image_priors(
+    scenes: List[Any],
+    known_characters: Optional[set],
+) -> Dict[str, Dict[str, float]]:
+    priors: Dict[str, Dict[str, float]] = {}
+    if not isinstance(scenes, list):
+        return priors
+
+    def _harvest_scores(blob: Any) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        if isinstance(blob, dict):
+            for key, value in blob.items():
+                if not isinstance(key, str):
+                    continue
+                try:
+                    score = float(value)
+                except Exception:
+                    continue
+                if math.isnan(score) or math.isinf(score):
+                    continue
+                score = _clamp01(score)
+                scores[_title_case_name(key)] = score
+        return scores
+
+    for idx, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            continue
+        scene_id = scene.get("id") or scene.get("scene_id") or f"S{idx+1}"
+        accum: Dict[str, List[float]] = defaultdict(list)
+        direct = scene.get("image_priors") or scene.get("image_bias")
+        if isinstance(direct, dict):
+            for name, score in _harvest_scores(direct).items():
+                accum[name].append(score)
+        image_cues = scene.get("image_cues") or scene.get("images") or []
+        if isinstance(image_cues, dict):
+            image_cues = [image_cues]
+        if isinstance(image_cues, list):
+            for cue in image_cues:
+                if isinstance(cue, dict):
+                    if "character_scores" in cue:
+                        harvested = _harvest_scores(cue.get("character_scores"))
+                    elif "scores" in cue:
+                        harvested = _harvest_scores(cue.get("scores"))
+                    elif "characters" in cue and isinstance(cue.get("characters"), list):
+                        harvested = { _title_case_name(n): 1.0 for n in cue["characters"] if isinstance(n, str) }
+                    else:
+                        harvested = {}
+                    for name, score in harvested.items():
+                        accum[name].append(score)
+        if accum:
+            priors[scene_id] = {}
+            for name, values in accum.items():
+                if known_characters and name not in known_characters:
+                    continue
+                priors[scene_id][name] = sum(values) / len(values)
+    return priors
+
+
+def _assign_scene_id_for_span(
+    span: Tuple[int, int],
+    scene_ranges: List[Tuple[str, int, int]],
+) -> Optional[str]:
+    if not scene_ranges:
+        return None
+    start, end = span
+    best: Optional[Tuple[str, int]] = None
+    for scene_id, s_start, s_end in scene_ranges:
+        if s_start <= start < s_end or s_start < end <= s_end or (start <= s_start and end >= s_end):
+            overlap = min(end, s_end) - max(start, s_start)
+            if overlap <= 0:
+                continue
+            if best is None or overlap > best[1]:
+                best = (scene_id, overlap)
+    return best[0] if best else None
+
+
+def _split_narration_for_llm(
+    full_text: str,
+    span: Tuple[int, int],
+    max_chars: int = 240,
+) -> List[Tuple[int, int]]:
+    start, end = span
+    snippet = full_text[start:end]
+    if not snippet.strip():
+        return []
+    trimmed = snippet.strip()
+    if len(trimmed) <= max_chars:
+        return [(start, end)]
+    pattern = re.compile(r".+?(?:[\.\!\?][\"”’']?\s+|$)", re.DOTALL)
+    segments: List[Tuple[int, int]] = []
+    current_start = None
+    current_end = None
+    for match in pattern.finditer(snippet):
+        seg_start = match.start()
+        seg_end = match.end()
+        if current_start is None:
+            current_start, current_end = seg_start, seg_end
+        else:
+            candidate = snippet[current_start:seg_end]
+            if len(candidate.strip()) <= max_chars:
+                current_end = seg_end
+            else:
+                segments.append((start + current_start, start + current_end))
+                current_start, current_end = seg_start, seg_end
+    if current_start is not None:
+        segments.append((start + current_start, start + (current_end or current_start)))
+    return segments
+
+
 def _write_sidecars(
     base_output_path: str,
     utterances: List[Dict[str, Any]],
@@ -1159,6 +1548,7 @@ def _write_sidecars(
     llm_enabled: bool,
     llm_model: Optional[str],
     llm_conf_threshold: float,
+    llm_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     base_output_path = _ensure_path_stem(base_output_path)
     txt_path = f"{base_output_path}_dialogue_marked.txt"
@@ -1169,7 +1559,12 @@ def _write_sidecars(
         lines.append("# voices_map: " + json.dumps(voices_map, ensure_ascii=False))
     for item in utterances:
         speaker = item.get("character") or "UNATTRIBUTED"
-        lines.append(f"{speaker}: {item.get('line', '').strip()}")
+        line_text = (item.get("line") or "").strip()
+        attr = item.get("attribution") or {}
+        if attr.get("method") == "llm_verified":
+            score = float(attr.get("score") or 0.0)
+            line_text = f"{line_text} (llm {score:.2f})"
+        lines.append(f"{speaker}: {line_text}")
     _write_text(txt_path, "\n".join(lines) + ("\n" if lines else ""))
 
     sanitized: List[Dict[str, Any]] = []
@@ -1213,7 +1608,7 @@ def _write_sidecars(
             "max": max(confidence_values),
         }
 
-    payload = {
+    llm_info: Dict[str, Any] = {
         "version": "1.1-hybrid",
         "source": {"created_utc": _now_utc()},
         "llm_assist": {
@@ -1221,6 +1616,16 @@ def _write_sidecars(
             "model": llm_model,
             "conf_threshold": llm_conf_threshold,
         },
+        "voices_map": voices_map or {},
+        "dialogue": sanitized,
+        "summary": summary,
+    }
+    if llm_stats:
+        llm_info["llm_assist"]["stats"] = llm_stats
+    payload = {
+        "version": llm_info["version"],
+        "source": llm_info["source"],
+        "llm_assist": llm_info["llm_assist"],
         "voices_map": voices_map or {},
         "dialogue": sanitized,
         "summary": summary,
@@ -1239,11 +1644,14 @@ def extract_and_save_dialogue(
     mode: str = "strict",
     confidence_threshold: float = 0.90,
     use_llm_assist: bool = False,
-    llm_conf_threshold: float = 0.92,
+    llm_conf_threshold: float = 0.83,
     llm_batch_size: int = 8,
     max_narrator_chars: Optional[int] = None,
     llm_model: Optional[str] = None,
     llm_client: Optional["OpenAIClient"] = None,
+    story_analysis: Optional[Dict[str, Any]] = None,
+    llm_scene_bias: bool = True,
+    llm_image_bias: bool = True,
 ) -> Dict[str, str]:
     """Extract dialogue from ``story_text`` and write the sidecar artifacts.
 
@@ -1252,17 +1660,21 @@ def extract_and_save_dialogue(
     LLM client. Outputs are written using the ``_dialogue_marked.txt`` and
     ``_analysis_dialogue.json`` suffixes beside ``base_output_path``.
     """
+    effective_max_narrator = max_narrator_chars
+    if use_llm_assist and effective_max_narrator is None:
+        effective_max_narrator = 240
 
     extractor = DialogueExtractor(
         known_characters=known_characters,
         aliases=character_aliases,
         mode=mode,
         confidence_threshold=confidence_threshold,
-        max_narrator_chars=max_narrator_chars,
+        max_narrator_chars=effective_max_narrator,
     )
     utterances = extractor.extract(story_text or "")
+    llm_stats: Optional[Dict[str, Any]] = None
     if use_llm_assist:
-        _apply_llm_assist(
+        llm_stats = _apply_llm_assist(
             story_text or "",
             utterances,
             known_characters,
@@ -1271,7 +1683,9 @@ def extract_and_save_dialogue(
             llm_batch_size,
             llm_model=llm_model,
             client=llm_client,
-
+            story_analysis=story_analysis,
+            llm_scene_bias=llm_scene_bias,
+            llm_image_bias=llm_image_bias,
         )
     return _write_sidecars(
         base_output_path,
@@ -1279,8 +1693,8 @@ def extract_and_save_dialogue(
         voices_map,
         llm_enabled=use_llm_assist,
         llm_model=llm_model,
-
         llm_conf_threshold=llm_conf_threshold,
+        llm_stats=llm_stats,
     )
 
 
@@ -1530,7 +1944,22 @@ def make_scene_fusion_user(ingredients: Dict[str, Any], global_style: str, negat
 # -----------------------------
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk, ImageEnhance, ImageFilter
+try:
+    from PIL import Image, ImageTk, ImageEnhance, ImageFilter
+except Exception:  # pragma: no cover - optional dependency for GUI features
+    class _ImageStub:
+        ADAPTIVE = None
+        LANCZOS = None
+
+        class Image:  # type: ignore[empty-body]
+            pass
+
+        @staticmethod
+        def open(*_args, **_kwargs):
+            raise RuntimeError("Pillow is required for image operations")
+
+    Image = _ImageStub()
+    ImageTk = ImageEnhance = ImageFilter = None
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     TKDND_AVAILABLE = True
@@ -1803,6 +2232,7 @@ def _contrast_norm(img: Image.Image) -> float:
         return 0.5
 
 
+
 def _colorfulness(img: Image.Image) -> float:
     try:
         im = img.convert("RGB").resize((128, 128))
@@ -1929,9 +2359,11 @@ def _llm_style_summary(self, sample_paths: List[str], analysis_ctx: str, fallbac
             if imgs:
                 user_payload.extend(imgs)
 
+
         # Always include a text hint describing the metrics already computed offline
         if fallback:
             user_payload.append({"type": "text", "text": "Offline cues to incorporate: " + fallback})
+
 
         data = client.chat_json(
             model=model,
@@ -3250,6 +3682,7 @@ def exposure_language(level: float) -> str:
         return "low-key look; deeper shadows; avoid crushed blacks; controlled highlights"
     return "neutral exposure; natural contrast; avoid crushed blacks or clipped highlights"
 
+
 def emissive_language(level: float) -> str:
     """Prompt-only hint for diegetic/practical light sources."""
     try:
@@ -3264,6 +3697,7 @@ def emissive_language(level: float) -> str:
     if l <= -0.33:
         return "no bloom; crisp practical lighting; avoid glows"
     return "naturalistic practical lighting with restrained bloom"
+
 
 def compose_character_dna(c: CharacterProfile, max_len: int = 3000) -> str:
     parts = []
@@ -11508,12 +11942,14 @@ class App:
         self._rebuild_character_panels()
         self._set_status("Imported character JSON for " + name)
 
+
     def _on_export_character_folder(self, name: str):
         c = self.characters[name]
         outdir = filedialog.askdirectory(title="Choose a folder to export this character")
         if not outdir: return
         char_dir = os.path.join(outdir, sanitize_name(name))
         ensure_dir(char_dir)
+
 
         exported = []
         for vkey, imgs in c.sheet_images.items():
@@ -11566,6 +12002,7 @@ class App:
         except Exception:
             same = (os.path.abspath(char_dir) == os.path.abspath(repo_dir))
 
+
         if same:
             messagebox.showinfo("Export", "Character exported to:\n" + char_dir)
         else:
@@ -11584,6 +12021,7 @@ class App:
             return
         for n in todo:
             self._on_propose_char_baseline(n)
+
 
     def _on_bulk_generate_char_views(self):
         todo = [n for n, p in self.char_panels.items() if p["select_var"].get()]
@@ -11790,13 +12228,16 @@ class App:
         lb: Optional[tk.Listbox] = panel.get("ref_list") if panel else None
         if not canvas or not label:
             return
+
         canvas.delete("all")
         panel["thumb_image"] = None
+
 
         c_obj = self.characters.get(name)
         if not c_obj:
             label.config(text="")
             return
+
 
         pri = (c_obj.primary_reference_id or "").strip()
         ids = list(c_obj.reference_images or [])
@@ -11822,6 +12263,7 @@ class App:
         if not path:
             label.config(text="(No valid image on disk)")
             return
+
 
         imtk, _ = self._load_thumb(path, max_side=168)
         if not imtk:
@@ -13071,11 +13513,6 @@ class App:
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
-        story_text = getattr(self, "_dialogue_story_text_cache", "")
-        if not story_text:
-            story_text = getattr(self, "_last_story_text", "")
-        if not story_text:
-            story_text = ""
 
         story_text = getattr(self, "_dialogue_story_text_cache", "")
         if not story_text:
@@ -13104,10 +13541,11 @@ class App:
 
         llm_enabled = bool(getattr(self, "enable_dialogue_llm", False))
         llm_model = getattr(self, "dialogue_llm_model", None)
-        llm_threshold = float(getattr(self, "dialogue_llm_threshold", 0.92))
+        llm_threshold = float(getattr(self, "dialogue_llm_threshold", 0.83))
         llm_batch = int(getattr(self, "dialogue_llm_batch_size", 8))
+        llm_stats = None
         if llm_enabled and story_text and utterances:
-            _apply_llm_assist(
+            llm_stats = _apply_llm_assist(
                 story_text,
                 utterances,
                 known_chars,
@@ -13116,6 +13554,7 @@ class App:
                 llm_batch,
                 llm_model=llm_model,
                 client=getattr(self, "client", None),
+                story_analysis=getattr(self, "analysis", None),
             )
 
         voices_map = getattr(self, "dialogue_voices_map", None)
@@ -13129,6 +13568,7 @@ class App:
             llm_enabled,
             llm_model,
             llm_threshold,
+            llm_stats=llm_stats,
         )
         self._dialogue_last_metadata = copy.deepcopy(utterances)
         return {"json": result["json_path"], "marked": result["txt_path"]}
@@ -13716,6 +14156,7 @@ class App:
                                 if sh.continuity_notes:
                                     entry["notes"] = sh.continuity_notes
 
+
                                 shot_entries.append(entry)
                     if not shot_entries and primary_prompt:
                         # Fallback: at least one shot
@@ -13763,6 +14204,7 @@ class App:
             )
         except Exception as exc:
             print(f"[DIALOGUE] analysis/emit failed: {exc}")
+
 
         if errors:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
