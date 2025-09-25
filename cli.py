@@ -179,7 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable image-derived hints during the LLM pass",
         default=True,
     )
-
     extract_parser.set_defaults(func=_command_dialogue_extract)
 
     scenes_parser = subparsers.add_parser("scenes", help="Scene tools")

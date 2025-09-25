@@ -30,7 +30,6 @@ import glob
 import math
 import statistics
 from collections import defaultdict
-
 import bisect
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -156,7 +155,6 @@ def _segment_lines(text: str) -> List[str]:
 # Hybrid dialogue extraction & attribution (rule-first, LLM optional)
 # -------------------------------------------------------------
 
-
 def _now_utc() -> int:
     return int(time.time())
 
@@ -271,6 +269,15 @@ class DialogueExtractor:
             + r")(?:\s+\w+)?",
             re.IGNORECASE | re.DOTALL,
         )
+        self.re_post_nv = re.compile(
+            r"[\"“„«‹'](?P<q>.+?)[\"””“»›']\s*[\.,;:?!—-]*\s*(?P<name>"
+            + name
+            + r")(?:\s+\w+){0,2}\s+(?:"
+            + verb_alt
+            + r")",
+            re.IGNORECASE | re.DOTALL,
+        )
+
         self.re_intr = re.compile(
             r"(?:\"|“|„|«|‹)(?P<q1>.+?)(?:\"|”|“|»|›)\s*,\s*(?P<name>"
             + name
@@ -682,6 +689,15 @@ class DialogueExtractor:
                         (1.0, "postposed_tag", f'postposed:{post_match.group("name").strip()}'),
                     )
 
+            post_nv_match = self.re_post_nv.search(quote_plus_tail)
+            if post_nv_match and self._clean_line(post_nv_match.group("q")) == self._clean_line(content):
+                canonical = self._canonicalize_name(post_nv_match.group("name"))
+                if canonical:
+                    candidate_scores.setdefault(
+                        canonical,
+                        (0.99, "postposed_tag_name_first", f'postposed_nv:{post_nv_match.group("name").strip()}'),
+                    )
+
             pre_match = re.search(
                 r"(?P<name>"
                 + self.NAME_RE
@@ -726,6 +742,30 @@ class DialogueExtractor:
                             (0.93, "appositive_nearby", f"emdash-context:{match_name.group(0).strip()}"),
                         )
 
+            if not candidate_scores:
+                pronoun_match = re.search(
+                    r"[\"“„«‹'](?P<q>.+?)[\"””“»›']\s*[\.,;:?!—-]*\s*(?P<pronoun>he|she|they)\b(?:\s+\w+){0,2}\s+(?:"
+                    + self._verb_alt
+                    + r")",
+                    quote_plus_tail,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if pronoun_match and self._clean_line(pronoun_match.group("q")) == self._clean_line(content):
+                    window_start = max(0, start - 240)
+                    window_text = text[window_start:start]
+                    found: List[str] = []
+                    for match in re.finditer(self.NAME_RE, window_text):
+                        canonical = self._canonicalize_name(match.group(0))
+                        if canonical and canonical not in found:
+                            found.append(canonical)
+                    if len(found) == 1:
+                        pronoun = pronoun_match.group("pronoun").lower()
+                        candidate_scores[found[0]] = (
+                            0.94,
+                            "pronoun_post_lookup",
+                            f"pronoun:{pronoun}",
+                        )
+
             if candidate_scores:
                 best_name, (best_score, method, evidence) = max(
                     candidate_scores.items(), key=lambda item: item[1][0]
@@ -745,6 +785,7 @@ class DialogueExtractor:
                     "name_candidate": name,
                 }
             else:
+
                 utterance["character"] = "UNATTRIBUTED"
                 utterance["attribution"] = {
                     "method": "none",
@@ -897,10 +938,6 @@ class DialogueExtractor:
         wrapped.sort(key=lambda item: item["char_span"][0])
         return wrapped
 
-
-class LLMAssistedAttributor:
-    """Optional hook for LLM-based attribution proposals."""
-
     def __init__(
         self,
         known_characters: Optional[List[str]],
@@ -958,6 +995,65 @@ class LLMAssistedAttributor:
             "utterance_id, character, confidence, evidence (rationale, name_span, verb_span, scene_bias_used, image_bias_used, notes)."
         )
 
+class LLMAssistedAttributor:
+    """Optional hook for LLM-based attribution proposals."""
+
+    def __init__(
+        self,
+        known_characters: Optional[List[str]],
+        aliases: Optional[Dict[str, List[str]]],
+        conf_threshold: float = 0.92,
+        batch_size: int = 8,
+        model: Optional[str] = None,
+        client: Optional["OpenAIClient"] = None,
+        scene_rosters: Optional[Dict[str, List[str]]] = None,
+        image_priors: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> None:
+        self.known = known_characters or []
+        self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
+        self.conf_threshold = float(conf_threshold)
+        self.batch_size = max(1, int(batch_size) if batch_size else 1)
+        if model:
+            self.model = model
+        else:
+            self.model = os.environ.get("DIALOGUE_LLM_MODEL", DEFAULT_LLM_MODEL)
+        self.client = client
+        self._client_error = False
+        self.scene_rosters = scene_rosters or {}
+        self.image_priors = image_priors or {}
+
+    def propose(self, full_text: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not candidates or self._client_error:
+            return []
+        client = self.client
+        if not client:
+            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                return []
+            org = os.environ.get("OPENAI_ORG_ID") or None
+            try:
+                client = OpenAIClient(api_key, organization=org)  # type: ignore[name-defined]
+            except Exception:
+                self._client_error = True
+                return []
+            self.client = client
+
+        allowed = [name for name in self.known if isinstance(name, str) and name.strip()]
+        if not allowed:
+            allowed = sorted({_title_case_name(name) for name in self.aliases.keys()})
+        allowed = list(dict.fromkeys(allowed))
+
+        alias_payload: Dict[str, List[str]] = {}
+        for name in allowed:
+            raw_aliases = sorted(a for a in self.aliases.get(name, set()) if isinstance(a, str) and a.strip())
+            if raw_aliases:
+                alias_payload[name] = raw_aliases
+
+        system_prompt = (
+            "You are a dialogue analyst. Attribute quoted speech in prose. Only use characters from this provided list. "
+            "Output JSON with utterance_id, character, confidence, evidence (name_span, verb_span)."
+        )
+
         outputs: List[Dict[str, Any]] = []
         step = self.batch_size or 1
         for start in range(0, len(candidates), step):
@@ -980,7 +1076,8 @@ class LLMAssistedAttributor:
                         "utterance_id": item.get("utterance_id"),
                         "phase": item.get("phase"),
                         "quote": item.get("line") or full_text[s:e],
-                        "context": full_text[cs:ce],
+                        "context_before": full_text[cs:s],
+                        "context_after": full_text[e:ce],
                         "char_span": [s, e],
                         "scene_id": item.get("scene_id"),
                         "scene_characters": item.get("scene_characters") or self.scene_rosters.get(item.get("scene_id"), []),
@@ -994,7 +1091,7 @@ class LLMAssistedAttributor:
             user_payload = {
                 "allowed_characters": allowed,
                 "aliases": alias_payload,
-                "utterances": payload_items,
+                "candidates": payload_items,
             }
             try:
                 data = client.chat_json(
@@ -1209,6 +1306,8 @@ def _apply_llm_assist(
         if canonical != "UNATTRIBUTED" and known_characters and canonical not in known_characters:
             continue
         evidence = proposal.get("evidence") or {}
+        if not (isinstance(evidence.get("name_span"), (list, tuple)) and isinstance(evidence.get("verb_span"), (list, tuple))):
+            continue
         valid = True
         for span_key, regex in (("name_span", name_re), ("verb_span", verb_re)):
             span = evidence.get(span_key)
@@ -1708,6 +1807,16 @@ DEFAULT_IMAGE_SIZE   = "1024x1024"
 IMAGE_SIZE_CHOICES   = ["1024x1024", "1536x1024", "1024x1536", "auto"]
 GLOBAL_STYLE_DEFAULT = "Photorealistic cinematic still"
 
+# -----------------------------
+# Config
+# -----------------------------
+DEFAULT_LLM_MODEL    = "gpt-5-chat-latest"
+LLM_MODEL_CHOICES    = [DEFAULT_LLM_MODEL, "gpt-5", "gpt-5-mini"]
+OPENAI_IMAGE_MODEL   = "gpt-image-1"
+DEFAULT_IMAGE_SIZE   = "1024x1024"
+IMAGE_SIZE_CHOICES   = ["1024x1024", "1536x1024", "1024x1536", "auto"]
+GLOBAL_STYLE_DEFAULT = "Photorealistic cinematic still"
+
 GLOBAL_STYLE_CHOICES = [GLOBAL_STYLE_DEFAULT, "3D cinematic render", "Graphic novel / inked", "No global style"]
 NEGATIVE_TERMS_POLICY = (
     "no text, no watermark, no logos, no nudity, no sexual content, no gore, no gratuitous violence, "
@@ -1728,6 +1837,7 @@ NEGATIVE_TERMS = ", ".join([NEGATIVE_TERMS_POLICY, NEGATIVE_TERMS_QUALITY])
 
 
 DEFAULT_ASPECT       = "21:9"
+
 
 # --- Aspect presets (new) ---
 ASPECT_CHOICES = ["1:1", "3:2", "2:3", "16:9", "21:9", "9:16"]
@@ -1882,6 +1992,7 @@ def scene_fusion_system(aspect_label: str) -> str:
         f"Use {FUSION_TARGET_WORDS_MIN}–{FUSION_TARGET_WORDS_MAX} words. Return a SINGLE JSON object only: "
         '{ \"prompt\": \"...\" }'
     )
+
 
 def make_scene_fusion_user(ingredients: Dict[str, Any], global_style: str, negative_terms: str) -> str:
     """
@@ -2232,8 +2343,8 @@ def _contrast_norm(img: Image.Image) -> float:
         return 0.5
 
 
-
 def _colorfulness(img: Image.Image) -> float:
+
     try:
         im = img.convert("RGB").resize((128, 128))
         pixels = list(im.getdata())
@@ -2359,11 +2470,9 @@ def _llm_style_summary(self, sample_paths: List[str], analysis_ctx: str, fallbac
             if imgs:
                 user_payload.extend(imgs)
 
-
         # Always include a text hint describing the metrics already computed offline
         if fallback:
             user_payload.append({"type": "text", "text": "Offline cues to incorporate: " + fallback})
-
 
         data = client.chat_json(
             model=model,
@@ -2424,6 +2533,7 @@ def _read_json(path: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root at {path} is not an object")
     return data
+
 
 def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
@@ -2892,6 +3002,7 @@ def _maybe_expand_scenes(analysis_path: str,
         cmap = _read_json(captions_path)
     except Exception as e:
         msg = f"[expand-scenes] skipped: load error: {e}"
+
         print(msg)
         LAST_EXPAND_SCENES_STATUS = msg
         LAST_EXPAND_SCENES_REPORT = None
@@ -3002,6 +3113,7 @@ def _maybe_expand_scenes(analysis_path: str,
         "extras": extras_report,
         "extra_dry_run": extra_dry_run,
     }
+
 
 def clean_json_from_text(text):
     if text is None:
@@ -3284,6 +3396,7 @@ ANALYZE_SYSTEM = (
 
 
 
+
 def make_analyze_user(story: str) -> str:
     parts = []
     parts.append("Story (may be expository / no proper names):\n---\n")
@@ -3374,6 +3487,36 @@ def shots_system(aspect_label: str) -> str:
 
 
 
+SHOTS_SYSTEM = (
+    "You are a seasoned storyboard artist and cinematographer. Respond with a SINGLE JSON object. "
+    "Return a SINGLE JSON OBJECT. No markdown/code fences/prose. "
+    "For each scene, propose 1–3 **expansive** shot prompts (120–220 words each) that combine:"
+    " composition rules (framing, balance, depth layers), lens+camera height, blocking, gesture, "
+    "light (key/fill/rim, color temperature, direction), atmosphere (haze, rain, dust, fog), palette, "
+    "texture, dynamic range, contrast handling, and mood. "
+    "Always assume WIDE aspect 21:9. Avoid proper-noun camera brand jargon. "
+    "Respect constraints: no text, no watermark, no logos. Return JSON only."
+)
+def shots_system(aspect_label: str) -> str:
+    return (
+        "You are a seasoned storyboard artist and cinematographer. Respond with a SINGLE JSON object. "
+        "Return a SINGLE JSON OBJECT. No markdown/code fences/prose. "
+        "For each scene, propose 1–3 expansive shot prompts (120–220 words each) that combine: "
+        "composition rules (framing, balance, depth layers), lens+camera height, blocking, gesture, "
+        "light (key/fill/rim, color temperature, direction), atmosphere (haze, rain, dust, fog), palette, "
+        "texture, dynamic range, contrast handling, and mood. "
+        f"Assume aspect {aspect_label}. Avoid proper-noun camera brand jargon. "
+        # Exterior/vehicle bias without dropping character coverage
+        "When ships/vehicles/aircraft/rovers or large exterior scale are present or implied, ensure at least "
+        "one shot is an EXTERIOR/ENVIRONMENTAL action view that favors the craft/environment over people; "
+        "if people appear, keep them small in frame or silhouetted (do not center faces). "
+        "Use motion cues when appropriate (thruster plumes, starfield parallax, contrails, dust trails, motion blur). "
+        # Composition guardrails to avoid 'sheepish portraits'
+        "Hard avoid: direct‑to‑camera gaze, selfie/posed portraits, centered head‑and‑shoulders, mugshot symmetry. "
+        "Favor off‑axis or over‑the‑shoulder viewpoints, layered depth (foreground/midground/background), and "
+        "environmental scale cues. Respect constraints: no text, no watermark, no logos. Return JSON only."
+    )
+
 def make_shots_user(
     story_summary: str,
     characters_ctx: List[Dict[str, Any]],
@@ -3381,6 +3524,7 @@ def make_shots_user(
     scenes: List[Dict[str, Any]],
     global_style: str,
     aspect_label: str,
+
 
 ) -> str:
     parts: List[str] = []
@@ -3551,10 +3695,10 @@ def make_loc_baseline_user(summary: str, name: str, description: str, mood: str,
     parts.append("Mood: "); parts.append(mood or "(none)"); parts.append("\n")
     parts.append("Lighting: "); parts.append(lighting or "(none)"); parts.append("\n")
     parts.append("Key props: "); parts.append(key_props or "(none)"); parts.append("\n")
+
     parts.append("Visual cues from photos: "); parts.append(cues or "(none)"); parts.append("\n\n")
     parts.append('Return JSON:\n{ "prompt": "" }')
     return "".join(parts)
-
 
 IMAGE_DESC_SYSTEM = (
     "You are a character visual analyst. From the photo(s), extract compact 'visual DNA' suitable for generation prompts: "
@@ -3682,7 +3826,6 @@ def exposure_language(level: float) -> str:
         return "low-key look; deeper shadows; avoid crushed blacks; controlled highlights"
     return "neutral exposure; natural contrast; avoid crushed blacks or clipped highlights"
 
-
 def emissive_language(level: float) -> str:
     """Prompt-only hint for diegetic/practical light sources."""
     try:
@@ -3697,7 +3840,6 @@ def emissive_language(level: float) -> str:
     if l <= -0.33:
         return "no bloom; crisp practical lighting; avoid glows"
     return "naturalistic practical lighting with restrained bloom"
-
 
 def compose_character_dna(c: CharacterProfile, max_len: int = 3000) -> str:
     parts = []
@@ -3772,6 +3914,7 @@ def join_clause(items: List[str]) -> str:
     if len(filtered) == 2:
         return f"{filtered[0]} and {filtered[1]}"
     return ", ".join(filtered[:-1]) + f", and {filtered[-1]}"
+
 
 
 def compose_master_scene_prompt(base_prompt: str,
@@ -3853,6 +3996,7 @@ class LLM:
         aspect_label: str | None = None,
         **kwargs,
     ) -> List["ShotPrompt"]:
+
         """
         Compatibility version:
         - Accepts new names (characters_ctx/locations_ctx) and old names (character_blocks/location_blocks).
@@ -10384,88 +10528,6 @@ class App:
         if not in_path:
             return
 
-        try:
-            data = _read_json_safely(in_path)
-            if not isinstance(data, dict):
-                raise ValueError("Not a JSON object")
-            style = data.get("style") if isinstance(data.get("style"), dict) else data
-            if not isinstance(style, dict):
-                raise ValueError("Invalid style structure")
-            sid = (style.get("id") or "").strip()
-            name = (style.get("name") or "").strip()
-            if not name:
-                name = sid or f"Imported_{int(time.time())}"
-                style["name"] = name
-            if not sid:
-                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
-                style["id"] = sid
-
-            user_styles = getattr(self, "_user_styles", []) or []
-            conflict_idx = -1
-            for idx, preset in enumerate(user_styles):
-                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    conflict_idx = idx
-                    break
-
-            if conflict_idx >= 0:
-                try:
-                    replace = messagebox.askyesno(
-                        "Import Style",
-                        f"Style id '{sid}' already exists.\nYes = Replace, No = Keep both.",
-                    )
-                except Exception:
-                    replace = True
-                if replace:
-                    user_styles[conflict_idx] = style
-                else:
-                    sid = f"{sid}_dup{int(time.time())}"
-                    style["id"] = sid
-                    user_styles.append(style)
-            else:
-                user_styles.append(style)
-
-            self.selected_style_id = sid
-            self.selected_style_name = style.get("name", "")
-            try:
-                self._save_user_styles()
-            except Exception:
-                pass
-
-            try:
-                if self.world_store_path:
-                    # persist default selection so the app doesn't revert to builtin on restart
-                    self.world["default_style_id"] = sid
-                    self._save_world_store_to(self.world_store_path)
-            except Exception:
-                pass
-
-            # Rebuild dropdown and select this style
-            try:
-                self._merge_styles_for_dropdown()
-            except Exception:
-                self._refresh_style_dropdown(preserve_selection=True)
-
-            # Show it selected in the combobox
-            try:
-                combo = getattr(self, "style_combo", None)
-                # _build_style_combo_options() keeps a map id->display; use it if present
-                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
-                if combo and display:
-                    combo.set(display)
-                    # notify selection logic
-                    self._on_style_selected()
-            except Exception:
-                pass
-
-            try:
-                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
-            except Exception:
-                print(f"[style] imported '{self.selected_style_name}'")
-        except Exception as exc:
-            try:
-                messagebox.showerror("Import failed", str(exc))
-            except Exception:
-                print(f"[style] import failed: {exc}")
 
     def import_style_from_path(self, path: str) -> str:
         """
@@ -10740,24 +10802,69 @@ class App:
             rebuild_list(select_id=preset.get("id"))
             self._refresh_style_dropdown(preserve_selection=False)
 
-        def _delete_selected():
-            selection = style_list.curselection()
-            if not selection:
-                return
-            label = style_list.get(selection[0])
-            preset = display_to_preset.get(label)
-            if not preset:
-                return
-            if not messagebox.askyesno("Delete style", f"Delete '{preset.get('name','style')}'?", parent=win):
-                return
-            sid = preset.get("id")
-            styles = (self.world or {}).get("style_presets") or []
-            self.world["style_presets"] = [p for p in styles if not (isinstance(p, dict) and p.get("id") == sid)]
-            if self.world.get("default_style_id") == sid:
-                self.world["default_style_id"] = ""
-            if self.selected_style_id == sid:
-                self.selected_style_id = ""
-                self.selected_style_name = self.global_style
+            # Rebuild dropdown and select this style
+            try:
+                self._merge_styles_for_dropdown()
+            except Exception:
+                self._refresh_style_dropdown(preserve_selection=True)
+
+            # Show it selected in the combobox
+            try:
+                combo = getattr(self, "style_combo", None)
+                # _build_style_combo_options() keeps a map id->display; use it if present
+                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
+                if combo and display:
+                    combo.set(display)
+                    # notify selection logic
+                    self._on_style_selected()
+            except Exception:
+                pass
+
+            try:
+                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
+            except Exception:
+                print(f"[style] imported '{self.selected_style_name}'")
+        except Exception as exc:
+            try:
+                messagebox.showerror("Import failed", str(exc))
+            except Exception:
+                print(f"[style] import failed: {exc}")
+
+    def import_style_from_path(self, path: str) -> str:
+        """
+        Import a style preset from a .style.json or .json file and make it the default selection.
+        Returns the preset id, or '' on failure.
+        """
+        try:
+            data = _read_json_safely(path)
+            if not isinstance(data, dict):
+                raise ValueError("Not a JSON object")
+            style = data.get("style") if isinstance(data.get("style"), dict) else data
+            if not isinstance(style, dict):
+                raise ValueError("Invalid style structure")
+            sid = (style.get("id") or "").strip()
+            name = (style.get("name") or "").strip()
+            if not name:
+                name = sid or f"Imported_{int(time.time())}"
+                style["name"] = name
+            if not sid:
+                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
+                style["id"] = sid
+
+            user_styles = getattr(self, "_user_styles", []) or []
+            # Replace if id exists, else append
+            for idx, preset in enumerate(user_styles):
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    user_styles[idx] = style
+                    break
+            else:
+                user_styles.append(style)
+
+            self.selected_style_id = sid
+            self.selected_style_name = style.get("name", "")
+            self.global_style = self.selected_style_name or self.global_style
+
+
             try:
                 self._save_user_styles()
             except Exception:
@@ -10769,6 +10876,362 @@ class App:
                 pass
             rebuild_list()
             self._refresh_style_dropdown(preserve_selection=False)
+
+
+        # Refresh Story/Scenes tab UI
+        try:
+            self.scenes_by_id = {s.get("id",""): s for s in (self.analysis.get("scenes") or []) if s.get("id")}
+            self._render_scene_table()
+            self._render_precis_and_movements()
+        except Exception:
+            pass
+
+        # Refresh Characters & Locations panes
+        try:
+            self._rebuild_character_panels()
+            self._rebuild_location_panels()
+        except Exception:
+            pass
+
+        self._set_status("Imported prior analysis.")
+        messagebox.showinfo("Analysis import", "Analysis loaded and applied.")
+
+    def _build_style_combo_options(self) -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+        values: List[str] = []
+        mapping: Dict[str, Dict[str, Any]] = {}
+        id_map: Dict[str, str] = {}
+
+        seen: set[str] = set()
+        for name in GLOBAL_STYLE_CHOICES:
+            label = name
+            values.append(label)
+            mapping[label] = {"kind": "builtin", "name": label}
+            seen.add(label)
+
+        styles: List[Dict[str, Any]]
+        try:
+            styles = [s for s in (self.world or {}).get("style_presets", []) if isinstance(s, dict)]
+        except Exception:
+            styles = []
+
+        if styles:
+            separator = "— User Styles —"
+            values.append(separator)
+            mapping[separator] = {"kind": "separator"}
+            seen.add(separator)
+            for preset in styles:
+                base = (preset.get("name") or preset.get("id") or "User style").strip() or "User style"
+                display = base
+                suffix = 2
+                while display in seen:
+                    display = f"{base} ({suffix})"
+                    suffix += 1
+                values.append(display)
+                mapping[display] = {"kind": "user", "preset": preset}
+                seen.add(display)
+                pid = (preset.get("id") or "").strip()
+                if pid:
+                    id_map[pid] = display
+
+        return values, mapping, id_map
+
+    def _apply_style_selection_from_display(self, display: str, *, quiet: bool = False) -> None:
+        info = self._style_combo_mapping.get(display)
+        if not info:
+            self.selected_style_id = ""
+            self.selected_style_name = display
+            if display:
+                self.global_style = display
+            return
+
+        kind = info.get("kind")
+        if kind == "separator":
+            return
+        if kind == "user":
+            preset = info.get("preset") or {}
+            pid = (preset.get("id") or "").strip()
+            self.selected_style_id = pid
+            self.selected_style_name = (preset.get("name") or preset.get("id") or "").strip()
+            if self.selected_style_name:
+                self.global_style = self.selected_style_name
+            if not quiet:
+                try:
+                    self._set_status(f"Style preset: {self.selected_style_name}")
+                except Exception:
+                    pass
+        else:
+            self.selected_style_id = ""
+            self.selected_style_name = display
+            if display:
+                self.global_style = display
+            if not quiet:
+                try:
+                    self._set_status(f"Global style: {display}")
+                except Exception:
+                    pass
+
+    def _refresh_style_dropdown(self, preserve_selection: bool = True) -> None:
+        combo = getattr(self, "style_combo", None)
+        if combo is None:
+            return
+
+        values, mapping, id_map = self._build_style_combo_options()
+        self._style_combo_mapping = mapping
+        self._style_display_by_id = id_map
+        try:
+            combo.configure(values=values)
+        except Exception:
+            combo["values"] = values
+
+        desired_display = None
+        # 1) If we were told to preserve, try the currently selected style id
+        if preserve_selection and self.selected_style_id:
+            desired_display = id_map.get(self.selected_style_id)
+
+        # 2) If no selection yet, prefer default_style_id from world.json
+        if not desired_display:
+            try:
+                dsid = (self.world or {}).get("default_style_id") or ""
+                if dsid:
+                    desired_display = id_map.get(dsid)
+                    if desired_display:
+                        self.selected_style_id = dsid
+            except Exception:
+                pass
+
+        # 3) Next, prefer a previously selected style name when it’s builtin
+        if not desired_display and not self.selected_style_id and self.global_style:
+            info = mapping.get(self.global_style)
+            if info and info.get("kind") == "builtin":
+                desired_display = self.global_style
+
+        # 4) Otherwise pick the first non-separator item
+        if not desired_display:
+            for candidate in values:
+                info = mapping.get(candidate)
+                if info and info.get("kind") != "separator":
+                    desired_display = candidate
+                    break
+        if desired_display:
+            try:
+                combo.set(desired_display)
+            except Exception:
+                pass
+            self._apply_style_selection_from_display(desired_display, quiet=True)
+
+    def _on_style_selected(self, _event=None):
+        combo = getattr(self, "style_combo", None)
+        if combo is None:
+            return
+        current = combo.get().strip()
+        info = self._style_combo_mapping.get(current)
+        if info and info.get("kind") == "separator":
+            previous_display = None
+            if self.selected_style_id:
+                previous_display = self._style_display_by_id.get(self.selected_style_id)
+            if not previous_display:
+                previous_display = self.selected_style_name or self.global_style or GLOBAL_STYLE_DEFAULT
+            if previous_display:
+                try:
+                    combo.set(previous_display)
+                except Exception:
+                    pass
+                self._apply_style_selection_from_display(previous_display, quiet=True)
+            return
+        self._apply_style_selection_from_display(current, quiet=False)
+        self._refresh_style_dropdown(preserve_selection=True)
+
+    def _export_style_dialog(self):
+        if getattr(self, "root", None) is None:
+            print("[style] export not available in headless mode")
+            return
+        sel_id = (getattr(self, "selected_style_id", "") or "").strip()
+        target = None
+        for preset in getattr(self, "_user_styles", []) or []:
+            if isinstance(preset, dict) and (preset.get("id") or "").strip() == sel_id:
+                target = preset
+                break
+        if not target:
+            try:
+                messagebox.showinfo("Export Style", "Select a user style to export.")
+            except Exception:
+                print("[style] select a user style to export")
+            return
+
+        default_name = (target.get("name") or target.get("id") or "style").strip() or "style"
+        default_name = sanitize_name(default_name) or "style"
+        out_path = filedialog.asksaveasfilename(
+            title="Export Style",
+            defaultextension=".style.json",
+            initialfile=f"{default_name}.style.json",
+            filetypes=[("Style JSON", "*.style.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        payload = _style_export_minimal_dict(target)
+        try:
+            ensure_dir(os.path.dirname(out_path) or ".")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            try:
+                messagebox.showerror("Export failed", str(exc))
+            except Exception:
+                print(f"[style] export failed: {exc}")
+            return
+
+        try:
+            base = os.path.splitext(out_path)[0]
+            for idx, path in enumerate(_style_preview_paths(self, target), start=1):
+                thumb_path = f"{base}.preview{idx}.jpg"
+                _save_thumb(path, thumb_path, max_side=320)
+        except Exception:
+            pass
+
+        try:
+            messagebox.showinfo("Export Style", f"Exported '{target.get('name', '(unnamed)')}'.")
+        except Exception:
+            print(f"[style] exported '{target.get('name', '(unnamed)')}' → {out_path}")
+
+    def _import_style_dialog(self):
+        if getattr(self, "root", None) is None:
+            print("[style] import not available in headless mode")
+            return
+        in_path = filedialog.askopenfilename(
+            title="Import Style",
+            filetypes=[("Style JSON", "*.style.json *.json"), ("All Files", "*.*")],
+        )
+        if not in_path:
+            return
+
+        try:
+            data = _read_json_safely(in_path)
+            if not isinstance(data, dict):
+                raise ValueError("Not a JSON object")
+            style = data.get("style") if isinstance(data.get("style"), dict) else data
+            if not isinstance(style, dict):
+                raise ValueError("Invalid style structure")
+            sid = (style.get("id") or "").strip()
+            name = (style.get("name") or "").strip()
+            if not name:
+                name = sid or f"Imported_{int(time.time())}"
+                style["name"] = name
+            if not sid:
+                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
+                style["id"] = sid
+
+            user_styles = getattr(self, "_user_styles", []) or []
+            conflict_idx = -1
+            for idx, preset in enumerate(user_styles):
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    conflict_idx = idx
+                    break
+
+            if conflict_idx >= 0:
+                try:
+                    replace = messagebox.askyesno(
+                        "Import Style",
+                        f"Style id '{sid}' already exists.\nYes = Replace, No = Keep both.",
+                    )
+                except Exception:
+                    replace = True
+                if replace:
+                    user_styles[conflict_idx] = style
+                else:
+                    sid = f"{sid}_dup{int(time.time())}"
+                    style["id"] = sid
+                    user_styles.append(style)
+            else:
+                user_styles.append(style)
+
+            self.selected_style_id = sid
+            self.selected_style_name = style.get("name", "")
+            try:
+                self._save_user_styles()
+            except Exception:
+                pass
+
+            try:
+                if self.world_store_path:
+                    # persist default selection so the app doesn't revert to builtin on restart
+                    self.world["default_style_id"] = sid
+                    self._save_world_store_to(self.world_store_path)
+            except Exception:
+                pass
+
+            # Rebuild dropdown and select this style
+            try:
+                self._merge_styles_for_dropdown()
+            except Exception:
+                self._refresh_style_dropdown(preserve_selection=True)
+
+            # Show it selected in the combobox
+            try:
+                combo = getattr(self, "style_combo", None)
+                # _build_style_combo_options() keeps a map id->display; use it if present
+                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
+                if combo and display:
+                    combo.set(display)
+                    # notify selection logic
+                    self._on_style_selected()
+            except Exception:
+                pass
+
+            try:
+                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
+            except Exception:
+                print(f"[style] imported '{self.selected_style_name}'")
+        except Exception as exc:
+            try:
+                messagebox.showerror("Import failed", str(exc))
+            except Exception:
+                print(f"[style] import failed: {exc}")
+
+    def import_style_from_path(self, path: str) -> str:
+        """
+        Import a style preset from a .style.json or .json file and make it the default selection.
+        Returns the preset id, or '' on failure.
+        """
+        try:
+            data = _read_json_safely(path)
+            if not isinstance(data, dict):
+                raise ValueError("Not a JSON object")
+            style = data.get("style") if isinstance(data.get("style"), dict) else data
+            if not isinstance(style, dict):
+                raise ValueError("Invalid style structure")
+            sid = (style.get("id") or "").strip()
+            name = (style.get("name") or "").strip()
+            if not name:
+                name = sid or f"Imported_{int(time.time())}"
+                style["name"] = name
+            if not sid:
+                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
+                style["id"] = sid
+
+            user_styles = getattr(self, "_user_styles", []) or []
+            # Replace if id exists, else append
+            for idx, preset in enumerate(user_styles):
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    user_styles[idx] = style
+                    break
+            else:
+                user_styles.append(style)
+
+            self.selected_style_id = sid
+            self.selected_style_name = style.get("name", "")
+            self.global_style = self.selected_style_name or self.global_style
+
+            try:
+                self._save_user_styles()
+            except Exception:
+                pass
+            try:
+                if self.world_store_path:
+                    self.world["default_style_id"] = sid
+                    self._save_world_store_to(self.world_store_path)
+            except Exception:
+                pass
 
         def _set_default_style():
             selection = style_list.curselection()
@@ -10791,6 +11254,7 @@ class App:
                 self.global_style = self.selected_style_name
             rebuild_list(select_id=sid)
             self._refresh_style_dropdown(preserve_selection=False)
+
 
         rename_btn.configure(command=_rename_selected)
         delete_btn.configure(command=_delete_selected)
@@ -10898,6 +11362,7 @@ class App:
                                    variable=self.exposure_bias_var, command=_on_exposure_change)
         exposure_scale.grid(row=11, column=1, sticky="we", padx=6, pady=(8,0))
 
+
         # ---- Post tone-map toggle ----
         ttk.Label(frm, text="Post tone-map").grid(row=12, column=0, sticky="w", padx=6)
         self.post_tonemap_var = tk.BooleanVar(value=bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP)))
@@ -10994,8 +11459,11 @@ class App:
         except Exception:
             try:
                 btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
             except Exception:
                 pass
+            rebuild_list(select_id=preset.get("id"))
+            self._refresh_style_dropdown(preserve_selection=False)
 
     def _on_drop_story(self, event):
         paths = self.root.splitlist(event.data)
@@ -11333,6 +11801,9 @@ class App:
         out_dir = filedialog.askdirectory(title="Choose a folder for dialogue files")
         if not out_dir:
             return
+
+        src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
+
 
         src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
 
@@ -11942,14 +12413,12 @@ class App:
         self._rebuild_character_panels()
         self._set_status("Imported character JSON for " + name)
 
-
     def _on_export_character_folder(self, name: str):
         c = self.characters[name]
         outdir = filedialog.askdirectory(title="Choose a folder to export this character")
         if not outdir: return
         char_dir = os.path.join(outdir, sanitize_name(name))
         ensure_dir(char_dir)
-
 
         exported = []
         for vkey, imgs in c.sheet_images.items():
@@ -12002,7 +12471,6 @@ class App:
         except Exception:
             same = (os.path.abspath(char_dir) == os.path.abspath(repo_dir))
 
-
         if same:
             messagebox.showinfo("Export", "Character exported to:\n" + char_dir)
         else:
@@ -12015,13 +12483,13 @@ class App:
         if not self.client:
             self._on_connect()
             if not self.client: return
+
         todo = [n for n, p in self.char_panels.items() if p["select_var"].get()]
         if not todo:
             messagebox.showinfo("Characters", "Tick at least one character.")
             return
         for n in todo:
             self._on_propose_char_baseline(n)
-
 
     def _on_bulk_generate_char_views(self):
         todo = [n for n, p in self.char_panels.items() if p["select_var"].get()]
@@ -12099,6 +12567,7 @@ class App:
             thumb_canvas.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(8,4), pady=4)
             thumb_label = ttk.Label(ref_frame, text="", width=32)
             thumb_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(0,4))
+
 
             def _loc_add_files(nm=name):
                 loc = self.locations.get(nm)
@@ -12228,16 +12697,13 @@ class App:
         lb: Optional[tk.Listbox] = panel.get("ref_list") if panel else None
         if not canvas or not label:
             return
-
         canvas.delete("all")
         panel["thumb_image"] = None
-
 
         c_obj = self.characters.get(name)
         if not c_obj:
             label.config(text="")
             return
-
 
         pri = (c_obj.primary_reference_id or "").strip()
         ids = list(c_obj.reference_images or [])
@@ -14155,7 +14621,6 @@ class App:
                                 entry = {"id": sh.id, "title": sh.title, "prompt": ptxt}
                                 if sh.continuity_notes:
                                     entry["notes"] = sh.continuity_notes
-
 
                                 shot_entries.append(entry)
                     if not shot_entries and primary_prompt:
