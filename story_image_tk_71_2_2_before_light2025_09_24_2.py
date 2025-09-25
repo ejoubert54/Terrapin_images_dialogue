@@ -469,6 +469,7 @@ class DialogueExtractor:
         utterances = self._interleave_narrator(self._text, speeches, self._line_starts)
         self._attribute_all(self._text, utterances)
         self._fuse_narrator_cues(self._text, utterances)
+
         if self.mode == "permissive":
             self._apply_permissive_rules(self._text, utterances)
         self._enforce_closed_set(utterances)
@@ -888,8 +889,10 @@ class LLMAssistedAttributor:
         aliases: Optional[Dict[str, List[str]]],
         conf_threshold: float = 0.92,
         batch_size: int = 8,
+
         model: Optional[str] = None,
         client: Optional["OpenAIClient"] = None,
+
     ) -> None:
         self.known = known_characters or []
         self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
@@ -1024,6 +1027,7 @@ class LLMAssistedAttributor:
         return outputs
 
 
+
 def _apply_llm_assist(
     full_text: str,
     utterances: List[Dict[str, Any]],
@@ -1033,6 +1037,7 @@ def _apply_llm_assist(
     batch_size: int,
     llm_model: Optional[str] = None,
     client: Optional["OpenAIClient"] = None,
+
 ) -> None:
     pending: List[Dict[str, Any]] = []
     for utterance in utterances:
@@ -1059,6 +1064,7 @@ def _apply_llm_assist(
         model=llm_model,
         client=client,
     )
+
     proposals = agent.propose(full_text, pending) or []
     id_map = {u["utterance_id"]: u for u in utterances}
     name_re = re.compile(DialogueExtractor.NAME_RE)
@@ -1147,6 +1153,7 @@ def _enforce_closed_set_after_llm(
             utterance["attribution"] = attr
         else:
             utterance["character"] = canonical
+
 
 
 def _write_sidecars(
@@ -1239,8 +1246,10 @@ def extract_and_save_dialogue(
     llm_conf_threshold: float = 0.92,
     llm_batch_size: int = 8,
     max_narrator_chars: Optional[int] = None,
+
     llm_model: Optional[str] = None,
     llm_client: Optional["OpenAIClient"] = None,
+
 ) -> Dict[str, str]:
     extractor = DialogueExtractor(
         known_characters=known_characters,
@@ -1258,15 +1267,19 @@ def extract_and_save_dialogue(
             character_aliases,
             llm_conf_threshold,
             llm_batch_size,
+
             llm_model=llm_model,
             client=llm_client,
+
         )
     return _write_sidecars(
         base_output_path,
         utterances,
         voices_map,
         llm_enabled=use_llm_assist,
+
         llm_model=llm_model,
+
         llm_conf_threshold=llm_conf_threshold,
     )
 
@@ -13033,6 +13046,11 @@ class App:
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
+        story_text = getattr(self, "_dialogue_story_text_cache", "")
+        if not story_text:
+            story_text = getattr(self, "_last_story_text", "")
+        if not story_text:
+            story_text = ""
 
         story_text = getattr(self, "_dialogue_story_text_cache", "")
         if not story_text:
