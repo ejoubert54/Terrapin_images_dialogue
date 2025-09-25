@@ -12613,19 +12613,22 @@ class App:
         for cue in cues:
             speaker = cue.speaker or "Narrator"
             text = (cue.text or "").strip()
+
             if not text:
                 continue
             lines.append(f"{speaker}: {text}")
         return "\n".join(lines).strip() + ("\n" if lines else "")
 
     def save_dialogue_artifacts(self, source_text_path: str, out_dir: str, cues: List[DialogueCue]) -> Dict[str, str]:
+
         """Persist the dialogue sidecars using the most recent extractor output."""
+
         src = Path(source_text_path) if source_text_path else None
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
-
         story_text = (
+
             getattr(self, "_dialogue_story_text_cache", "")
             or getattr(self, "_last_story_text", "")
             or ""
