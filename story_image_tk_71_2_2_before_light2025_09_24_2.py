@@ -11691,104 +11691,336 @@ class App:
 
     def build_dialogue_cues(self, story_text: str) -> List[DialogueCue]:
         """
-        Extract narrator vs. spoken lines, attribute speakers, infer emotion.
-        Returns ordered DialogueCue list without timings (filled later).
+        Rule-based dialogue + narration extractor with deterministic speaker
+        attribution, following the condensed logic defined for dialogue
+        sidecars. Returns ordered DialogueCue list (timings filled later).
         """
-        cues: List[DialogueCue] = []
-        spans = _extract_quote_spans(story_text or "")
+
+        text = story_text or ""
+        if not text.strip():
+            self._dialogue_last_metadata = []
+            return []
+
+        CONF_LEVELS = {
+            "A": 1.00,
+            "B": 0.98,
+            "C": 0.96,
+            "D": 0.95,
+            "E": 0.93,
+        }
+        ATTR_THRESHOLD = 0.90
+        QUOTE_PAIRS = [("“", "”"), ('"', '"'), ("'", "'"), ("‘", "’")]
+
+        def _clean_text(s: str) -> str:
+            return re.sub(r"\s+", " ", s or "").strip()
+
+        def _gather_allowed_characters() -> List[str]:
+            names: List[str] = []
+            seen = set()
+            analysis_obj = getattr(self, "analysis", {})
+            analysis = analysis_obj if isinstance(analysis_obj, dict) else {}
+
+            def _push(name: Optional[str]):
+                if not name:
+                    return
+                key = _title_case_name(name)
+                if key and key not in seen:
+                    seen.add(key)
+                    names.append(key)
+
+            for key in (
+                "characters",
+                "main_characters",
+                "character_list",
+                "cast",
+                "dramatis_personae",
+            ):
+                val = analysis.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict):
+                            _push(item.get("name") or item.get("character"))
+                        elif isinstance(item, str):
+                            _push(item)
+
+            scenes = analysis.get("scenes")
+            if isinstance(scenes, list):
+                for scene in scenes:
+                    if isinstance(scene, dict):
+                        chars = scene.get("characters_present") or scene.get("characters")
+                        if isinstance(chars, list):
+                            for c in chars:
+                                _push(c)
+
+            extra = analysis.get("character_aliases")
+            if isinstance(extra, dict):
+                for base, aliases in extra.items():
+                    _push(base)
+                    if isinstance(aliases, list):
+                        for alias in aliases:
+                            _push(alias)
+
+            return names
+
+        allowed_characters = set(_gather_allowed_characters())
+
+        metadata: List[Dict[str, Any]] = []
+        speech_segments: List[Dict[str, Any]] = []
+
+        def _ranges_overlap(existing: List[Tuple[int, int]], start: int, end: int) -> bool:
+            for (a, b) in existing:
+                if start < b and end > a:
+                    return True
+            return False
+
         used_ranges: List[Tuple[int, int]] = []
 
-        # 1) Handle explicit quoted lines with attribution in tails
-        order = 1
-        for (start, end, quoted, tail) in spans:
-            speaker = _guess_speaker_from_tail(tail) or "Unknown"
-            emotion, emo_conf = _find_inline_emotion(quoted)
-            conf = 0.85 if speaker != "Unknown" else 0.55
-            cues.append(
-                DialogueCue(
-                    order=order,
-                    speaker=("Narrator" if speaker == "Unknown" else speaker),
-                    text=_strip_quotes(quoted),
-                    emotion=emotion,
-                    speaker_conf=conf,
-                    emotion_conf=emo_conf,
-                )
-            )
-            order += 1
-            used_ranges.append((start, end))
-
-        # 2) Try colon/emdash labelled dialogue lines e.g. Alice: "..."
-        lines = _segment_lines(story_text or "")
-        for ln in lines:
-            lab = _guess_speaker_from_label(ln)
-            if not lab:
+        # Script/labelled dialogue: NAME: line
+        script_pat = re.compile(r"(?m)^(?P<name>[A-Z][A-Za-z0-9 .\-']{1,40})\s*[:：]\s*(?P<body>[^\n]+)")
+        for m in script_pat.finditer(text):
+            body = _clean_text(m.group("body"))
+            if not body:
                 continue
-            m = re.search(r"“([^”]+)”|\"([^\"]+)\"", ln)
+            speaker = _title_case_name(m.group("name"))
+            speech_segments.append(
+                {
+                    "start": m.start(),
+                    "end": m.end(),
+                    "text": body,
+                    "speaker": speaker,
+                    "score": CONF_LEVELS["A"],
+                    "method": "script_label",
+                }
+            )
+            used_ranges.append((m.start(), m.end()))
+
+        # Em-dash dialogue lines (— Hello)
+        dash_pat = re.compile(r"(?m)^[\t ]*[—\-]\s*(?P<body>[^\n]+)")
+        for m in dash_pat.finditer(text):
+            body = _clean_text(m.group("body"))
+            if not body:
+                continue
+            if _ranges_overlap(used_ranges, m.start(), m.end()):
+                continue
+            speech_segments.append(
+                {
+                    "start": m.start(),
+                    "end": m.end(),
+                    "text": body,
+                    "speaker": None,
+                    "score": 0.0,
+                    "method": "emdash_line",
+                }
+            )
+            used_ranges.append((m.start(), m.end()))
+
+        def _assign_speaker(pre: str, tail: str) -> Tuple[Optional[str], float, str]:
+            candidates: List[Tuple[float, str, str]] = []
+            window_tail = tail[:240]
+            window_pre = pre[-240:]
+
+            # Interruption pattern: said NAME,
+            m = re.search(rf"\b{_SAY_VERBS}\s+([A-Z][A-Za-z.\-']{{1,40}})\b\s*,\s*[\"“]", window_tail)
             if m:
-                q = m.group(1) or m.group(2) or ""
-                emotion, emo_conf = _find_inline_emotion(q)
+                candidates.append((CONF_LEVELS["C"], _title_case_name(m.group(1)), "interruption"))
+
+            # Postposed: said NAME
+            m = re.search(rf"\b{_SAY_VERBS}\s+([A-Z][A-Za-z.\-']{{1,40}})\b", window_tail)
+            if m:
+                candidates.append((CONF_LEVELS["A"], _title_case_name(m.group(1)), "postposed"))
+
+            # Postposed variant: NAME said
+            m = re.search(rf"\b([A-Z][A-Za-z.\-']{{1,40}})\b\s+{_SAY_VERBS}\b", window_tail)
+            if m:
+                candidates.append((CONF_LEVELS["C"], _title_case_name(m.group(1)), "postposed_name_first"))
+
+            # Appositive em-dash: — NAME ... verb nearby
+            m = re.search(r"[—\-]\s*([A-Z][A-Za-z.\-']{1,40})\b", window_tail)
+            if m:
+                candidates.append((CONF_LEVELS["D"], _title_case_name(m.group(1)), "appositive"))
+
+            # Preposed: NAME said "..."
+            m = re.search(rf"([A-Z][A-Za-z.\-']{{1,40}})\s+{_SAY_VERBS}\b[^\n\"\u201c\u201d']{{0,80}}$", window_pre)
+            if m:
+                candidates.append((CONF_LEVELS["B"], _title_case_name(m.group(1)), "preposed"))
+
+            # Preposed variant: said NAME before quote
+            m = re.search(rf"{_SAY_VERBS}\s+([A-Z][A-Za-z.\-']{{1,40}})\b[^\n\"\u201c\u201d']{{0,80}}$", window_pre)
+            if m:
+                candidates.append((CONF_LEVELS["B"], _title_case_name(m.group(1)), "preposed_verb_first"))
+
+            if not candidates:
+                return None, 0.0, "unattributed"
+
+            candidates.sort(key=lambda tup: tup[0], reverse=True)
+            score, speaker, method = candidates[0]
+            if allowed_characters and speaker not in allowed_characters:
+                return None, 0.0, method
+            return speaker, score, method
+
+        # Quoted speech
+        for open_q, close_q in QUOTE_PAIRS:
+            pattern = re.compile(re.escape(open_q) + r"(.*?)" + re.escape(close_q), re.DOTALL)
+            for m in pattern.finditer(text):
+                start, end = m.start(), m.end()
+                if _ranges_overlap(used_ranges, start, end):
+                    continue
+                quoted = _clean_text(m.group(1))
+                if not quoted:
+                    continue
+                pre = text[max(0, start - 320):start]
+                tail = text[end : min(len(text), end + 320)]
+                speaker, score, method = _assign_speaker(pre, tail)
+                speech_segments.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "text": quoted,
+                        "speaker": speaker,
+                        "score": score,
+                        "method": method,
+                    }
+                )
+                used_ranges.append((start, end))
+
+        speech_segments.sort(key=lambda seg: seg["start"])
+        for idx, seg in enumerate(speech_segments):
+            seg["index"] = idx
+
+        llm_results: Dict[int, Dict[str, Any]] = {}
+        llm_threshold = 0.92
+        llm_helper = getattr(self, "dialogue_llm_helper", None)
+        if getattr(self, "enable_dialogue_llm", False) and callable(llm_helper):
+            try:
+                llm_results = (
+                    llm_helper(
+                        text=text,
+                        segments=copy.deepcopy(speech_segments),
+                        allowed_characters=sorted(allowed_characters),
+                        threshold=llm_threshold,
+                    )
+                    or {}
+                )
+            except Exception:
+                llm_results = {}
+
+        order = 1
+        cues: List[DialogueCue] = []
+
+        def _append_narrator(chunk: str, span: Tuple[int, int]) -> None:
+            nonlocal order
+            cleaned = _clean_text(chunk)
+            if not cleaned:
+                return
+            sentences = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z0-9\"“'\(])", cleaned)
+            for sent in sentences:
+                sent_clean = _clean_text(sent)
+                if not sent_clean:
+                    continue
+                emotion, emo_conf = _find_inline_emotion(sent_clean)
                 cues.append(
                     DialogueCue(
                         order=order,
-                        speaker=lab,
-                        text=_strip_quotes(q),
+                        speaker="Narrator",
+                        text=sent_clean,
                         emotion=emotion,
-                        speaker_conf=0.9,
+                        speaker_conf=1.0,
                         emotion_conf=emo_conf,
                     )
                 )
+                metadata.append(
+                    {
+                        "order": order,
+                        "speaker_source": "narration",
+                        "span": {"start": span[0], "end": span[1]},
+                    }
+                )
                 order += 1
 
-        # 3) Narration lines (non-quoted content)
-        story_wo_quotes = re.sub(r"“[^”]+”|\"[^\"]+\"|\'[^\']+\'", " ", story_text or "")
-        for ln in _segment_lines(story_wo_quotes):
-            t = (ln or "").strip()
-            if not t:
-                continue
-            if len(t) < 3:
-                continue
-            emotion, emo_conf = _find_inline_emotion(t)
-            cues.append(
-                DialogueCue(
-                    order=order,
-                    speaker="Narrator",
-                    text=t,
-                    emotion=emotion,
-                    speaker_conf=0.95,
-                    emotion_conf=emo_conf,
-                )
-            )
-            order += 1
+        cursor = 0
+        for seg in speech_segments:
+            start, end = seg["start"], seg["end"]
+            if start > cursor:
+                _append_narrator(text[cursor:start], (cursor, start))
 
-        # 4) De-duplicate by (speaker,text) order while keeping sequence
-        seen = set()
-        uniq: List[DialogueCue] = []
-        for cue in cues:
-            key = (cue.speaker, cue.text)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(cue)
-        return uniq
+            raw_text = _clean_text(seg.get("text", ""))
+            if raw_text:
+                nonlocal_speaker = seg.get("speaker")
+                score = seg.get("score", 0.0)
+                method = seg.get("method", "unattributed")
+                speaker_conf = score if score >= ATTR_THRESHOLD else 0.5
+                speaker = nonlocal_speaker if score >= ATTR_THRESHOLD and nonlocal_speaker else "UNATTRIBUTED"
+
+                if speaker == "UNATTRIBUTED" and llm_results:
+                    seg_idx = seg.get("index")
+                    llm_data = llm_results.get(seg_idx) if isinstance(seg_idx, int) else None
+                    if isinstance(llm_data, dict):
+                        candidate = llm_data.get("character")
+                        conf = float(llm_data.get("confidence", 0.0))
+                        evidence = llm_data.get("evidence", {})
+                        if candidate and conf >= llm_threshold:
+                            candidate_name = _title_case_name(str(candidate))
+                            if (not allowed_characters) or (candidate_name in allowed_characters):
+                                speaker = candidate_name
+                                speaker_conf = conf
+                                method = "llm_assist"
+                                seg["speaker"] = speaker
+                                seg["score"] = conf
+                                seg["method"] = method
+                                if isinstance(evidence, dict):
+                                    seg["llm_evidence"] = evidence
+
+                emotion, emo_conf = _find_inline_emotion(raw_text)
+                cues.append(
+                    DialogueCue(
+                        order=order,
+                        speaker=speaker,
+                        text=_strip_quotes(raw_text),
+                        emotion=emotion,
+                        speaker_conf=speaker_conf,
+                        emotion_conf=emo_conf,
+                    )
+                )
+                metadata.append(
+                    {
+                        "order": order,
+                        "speaker_source": method,
+                        "span": {"start": start, "end": end},
+                        "raw_speaker": nonlocal_speaker or "",
+                        "attribution_score": float(score),
+                        "llm_applied": method == "llm_assist",
+                        "llm_evidence": seg.get("llm_evidence"),
+                    }
+                )
+                order += 1
+
+            cursor = max(cursor, end)
+
+        if cursor < len(text):
+            _append_narrator(text[cursor:], (cursor, len(text)))
+
+        self._dialogue_last_metadata = metadata
+        return cues
 
     def emit_marked_text(self, story_text: str, cues: List[DialogueCue]) -> str:
         """
-        Rewrite text with standard markers on separate lines preceding content.
-        Marker format (easy to parse in Caption_App):
-        [[SPEAKER:<Name>]][[EMOTION:<tag>]]
+        Emit a linear "Character: line" script suitable for downstream TTS
+        batching (e.g., ElevenLabs). Narration is labelled as Narrator.
         """
-        buf: List[str] = []
+        lines: List[str] = []
         for cue in cues:
-            sp = cue.speaker if cue.speaker else "Narrator"
-            em = cue.emotion if cue.emotion else "neutral"
-            buf.append(f"[[SPEAKER:{sp}]][[EMOTION:{em}]] {cue.text}")
-        return "\n".join(buf).strip() + "\n"
+            speaker = cue.speaker or "Narrator"
+            text = cue.text.strip()
+            if not text:
+                continue
+            lines.append(f"{speaker}: {text}")
+        return "\n".join(lines).strip() + ("\n" if lines else "")
 
     def save_dialogue_artifacts(self, source_text_path: str, out_dir: str, cues: List[DialogueCue]) -> Dict[str, str]:
         """
         Save:
-          - <basename>__dialogue.json  (ordered cues)
-          - <basename>__marked.txt     (tagged transcript)
+          - <basename>_analysis_dialogue.json (dialogue array + summary)
+          - <basename>_dialogue_marked.txt    (linear script)
         Returns paths.
         """
         src = Path(source_text_path) if source_text_path else None
@@ -11796,14 +12028,50 @@ class App:
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
 
-        jpath = outp / f"{base}__dialogue.json"
-        tpath = outp / f"{base}__marked.txt"
+        jpath = outp / f"{base}_analysis_dialogue.json"
+        tpath = outp / f"{base}_dialogue_marked.txt"
+
+        payload_dialogue = [asdict(c) for c in cues]
+
+        voices_map: Dict[str, Dict[str, Any]] = {}
+        for cue in cues:
+            speaker_key = cue.speaker or "Narrator"
+            if speaker_key not in voices_map:
+                voices_map[speaker_key] = {
+                    "utterance_count": 0,
+                    "elevenlabs_input": [],
+                }
+            voices_map[speaker_key]["utterance_count"] += 1
+            if cue.text:
+                voices_map[speaker_key]["elevenlabs_input"].append(cue.text)
+
+        for speaker_key, data in voices_map.items():
+            data["elevenlabs_input"] = "\n".join(data["elevenlabs_input"]).strip()
+
+        by_speaker: Dict[str, int] = {}
+        unattributed = 0
+        for cue in cues:
+            name = cue.speaker or "Narrator"
+            by_speaker[name] = by_speaker.get(name, 0) + 1
+            if name == "UNATTRIBUTED":
+                unattributed += 1
+
+        summary = {
+            "total_utterances": len(cues),
+            "unique_speakers": sorted(by_speaker.keys()),
+            "by_speaker": by_speaker,
+            "unattributed_count": unattributed,
+        }
 
         payload = {
-            "version": "1.0",
+            "version": "2.0",
             "source_file": str(src) if src else "",
-            "dialogue": [asdict(c) for c in cues],
+            "dialogue": payload_dialogue,
+            "summary": summary,
+            "voices_map": voices_map,
+            "metadata": getattr(self, "_dialogue_last_metadata", []),
         }
+
         with open(jpath, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
