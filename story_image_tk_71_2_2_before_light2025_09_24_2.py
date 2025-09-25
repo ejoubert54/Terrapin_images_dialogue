@@ -12718,10 +12718,13 @@ class App:
 
     def save_dialogue_artifacts(self, source_text_path: str, out_dir: str, cues: List[DialogueCue]) -> Dict[str, str]:
         """Persist the dialogue sidecars using the most recent extractor output."""
+
         src = Path(source_text_path) if source_text_path else None
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
+        story_text = (
+
 
         story_text = (
             getattr(self, "_dialogue_story_text_cache", "")
@@ -13405,6 +13408,7 @@ class App:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
         else:
             messagebox.showinfo("Export", "Export completed to:\n" + outdir)
+
 
 
 
