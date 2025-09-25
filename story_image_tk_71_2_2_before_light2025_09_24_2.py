@@ -29,6 +29,7 @@ import shutil
 import glob
 import math
 import statistics
+import bisect
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -147,6 +148,816 @@ def _segment_lines(text: str) -> List[str]:
             sents = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z0-9“\"'(])", p.strip())
             out.extend(sents)
     return out
+
+
+# -------------------------------------------------------------
+# Hybrid dialogue extraction & attribution (rule-first, LLM optional)
+# -------------------------------------------------------------
+
+def _now_utc() -> int:
+    return int(time.time())
+
+
+def _ensure_path_stem(path: str) -> str:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    else:
+        os.makedirs(".", exist_ok=True)
+    return path
+
+
+def _write_json(path: str, obj: Any) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+
+
+def _write_text(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+class DialogueExtractor:
+    """
+    Deterministic extractor that segments dialogue/narration spans and
+    attributes speakers via rule-based scoring. Optional permissive mode
+    unlocks alternation/pronoun heuristics.
+    """
+
+    DIALOGUE_VERBS = {
+        "said",
+        "asked",
+        "replied",
+        "answered",
+        "whispered",
+        "shouted",
+        "yelled",
+        "murmured",
+        "muttered",
+        "exclaimed",
+        "cried",
+        "called",
+        "noted",
+        "added",
+        "continued",
+        "insisted",
+        "agreed",
+        "snapped",
+        "barked",
+        "growled",
+        "sighed",
+        "responded",
+        "remarked",
+        "stated",
+    }
+
+    QUOTE_PAIRS = [
+        ("\"", "\""),
+        ("“", "”"),
+        ("„", "“"),
+        ("«", "»"),
+        ("‹", "›"),
+        ("'", "'"),
+    ]
+
+    DASH_PREFIXES = ["—", "–"]
+
+    NAME_RE = r"(?:(?:Dr|Mr|Mrs|Ms|Mx|Prof)\.\s+)?[A-Z][a-z]+(?:[-\s][A-Z][a-z]+){0,2}|[A-Z]{2,}(?:\s+[A-Z]{2,})?"
+
+    def __init__(
+        self,
+        known_characters: Optional[List[str]] = None,
+        aliases: Optional[Dict[str, List[str]]] = None,
+        mode: str = "strict",
+        confidence_threshold: float = 0.90,
+        max_narrator_chars: Optional[int] = None,
+    ) -> None:
+        self.known = [*(known_characters or [])]
+        self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
+        self.mode = (mode or "strict").lower()
+        self.ct = float(confidence_threshold or 0.0)
+        self.max_narrator = max_narrator_chars if max_narrator_chars is None else int(max_narrator_chars)
+        self._build_regexes()
+        self._line_starts: List[int] = []
+        self._text: str = ""
+        self._name_counts: Dict[str, int] = {}
+        self.known_lookup = {name.lower(): name for name in self.known}
+        self.alias_lookup: Dict[str, str] = {}
+        for base, vals in self.aliases.items():
+            canonical = base
+            if canonical.lower() not in self.alias_lookup:
+                self.alias_lookup[canonical.lower()] = canonical
+            for alias in vals:
+                if isinstance(alias, str):
+                    self.alias_lookup[alias.lower()] = canonical
+        for name in self.known:
+            self.alias_lookup.setdefault(name.lower(), name)
+
+    def _build_regexes(self) -> None:
+        verb_alt = r"(?:" + "|".join(sorted(map(re.escape, self.DIALOGUE_VERBS))) + r")"
+        self._verb_alt = verb_alt
+        name = self.NAME_RE
+        self.re_script = re.compile(r"^(?P<name>" + name + r")\s*:\s*(?P<body>.+)$", re.MULTILINE)
+        self.re_emdash = re.compile(r"^(?:\t|\s)*(—|–)\s*(?P<body>.+)$", re.MULTILINE)
+        self.re_post = re.compile(
+            r"[\"“„«‹'](?P<q>.+?)[\"””“»›']\s*[\.,;:?!—-]*\s*(?:,?\s*)?(?:\\)?\s*(?:-\s*)?(?:"
+            + verb_alt
+            + r")\s+(?P<name>"
+            + name
+            + r")(?:\s+\w+)?",
+            re.IGNORECASE | re.DOTALL,
+        )
+        self.re_intr = re.compile(
+            r"(?:\"|“|„|«|‹)(?P<q1>.+?)(?:\"|”|“|»|›)\s*,\s*(?P<name>"
+            + name
+            + r")\s+(?:"
+            + verb_alt
+            + r")\s*,\s*(?:\"|“|„|«|‹)(?P<q2>.+?)(?:\"|”|“|»|›)",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+    def _compute_line_starts(self, text: str) -> List[int]:
+        starts = [0]
+        idx = text.find("\n")
+        pos = 0
+        while idx != -1:
+            starts.append(idx + 1)
+            pos = idx + 1
+            idx = text.find("\n", pos)
+        return starts
+
+    def _line_for_index(self, index: int) -> int:
+        if not self._line_starts:
+            return 1
+        pos = bisect.bisect_right(self._line_starts, index) - 1
+        return max(1, pos + 1)
+
+    @staticmethod
+    def _clean_line(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip()
+
+    def _count_names(self, text: str) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for match in re.finditer(self.NAME_RE, text):
+            name = self._clean_line(match.group(0))
+            if not name:
+                continue
+            canonical = name if name.isupper() else name.title()
+            counts[canonical] = counts.get(canonical, 0) + 1
+        return counts
+
+    def _canonicalize_name(self, raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        cleaned = self._clean_line(raw)
+        if not cleaned:
+            return None
+        key = cleaned.lower()
+        if self.known:
+            if key in self.alias_lookup:
+                return self.alias_lookup[key]
+            if key in self.known_lookup:
+                return self.known_lookup[key]
+            for name in self.known:
+                if name.lower() == key:
+                    return name
+            return None
+        if key in self.alias_lookup:
+            return self.alias_lookup[key]
+        candidate = cleaned if cleaned.isupper() else cleaned.title()
+        if self._name_counts.get(candidate, 0) >= 2:
+            return candidate
+        return None
+
+    def extract(self, text: str) -> List[Dict[str, Any]]:
+        self._text = text or ""
+        self._line_starts = self._compute_line_starts(self._text)
+        self._name_counts = self._count_names(self._text)
+
+        speeches = self._detect_speech(self._text)
+        utterances = self._interleave_narrator(self._text, speeches, self._line_starts)
+        self._attribute_all(self._text, utterances)
+        if self.mode == "permissive":
+            self._apply_permissive_rules(self._text, utterances)
+        self._enforce_closed_set(utterances)
+        if isinstance(self.max_narrator, int):
+            utterances = self._wrap_narrator_spans(utterances)
+        for idx, utterance in enumerate(utterances, start=1):
+            utterance["utterance_id"] = f"dlg_{idx:06d}"
+        for utterance in utterances:
+            utterance.pop("_speech_type", None)
+            utterance.pop("_content", None)
+            utterance.pop("_script_name", None)
+        return utterances
+
+    def _detect_speech(self, text: str) -> List[Dict[str, Any]]:
+        speeches: List[Dict[str, Any]] = []
+        used_ranges: List[Tuple[int, int]] = []
+
+        def ranges_overlap(start: int, end: int) -> bool:
+            for a, b in used_ranges:
+                if start < b and end > a:
+                    return True
+            return False
+
+        for match in self.re_script.finditer(text):
+            body_start = match.start("body")
+            body_end = match.end("body")
+            line = self._clean_line(text[body_start:body_end])
+            if not line:
+                continue
+            speeches.append(
+                {
+                    "start": body_start,
+                    "end": body_end,
+                    "text": line,
+                    "_speech_type": "script",
+                    "_script_name": match.group("name"),
+                    "_content": line,
+                }
+            )
+            used_ranges.append((match.start(), match.end()))
+
+        for match in self.re_emdash.finditer(text):
+            body_start = match.start("body")
+            body_end = match.end("body")
+            if ranges_overlap(body_start, body_end):
+                continue
+            line = self._clean_line(text[body_start:body_end])
+            if not line:
+                continue
+            speeches.append(
+                {
+                    "start": body_start,
+                    "end": body_end,
+                    "text": line,
+                    "_speech_type": "emdash",
+                    "_content": line,
+                }
+            )
+            used_ranges.append((match.start(), match.end()))
+
+        for open_q, close_q in self.QUOTE_PAIRS:
+            pattern = re.compile(re.escape(open_q) + r"(.*?)" + re.escape(close_q), re.DOTALL)
+            pos = 0
+            while True:
+                match = pattern.search(text, pos)
+                if not match:
+                    break
+                start = match.start()
+                end = match.end()
+                pos = match.start() + 1
+                if ranges_overlap(start, end):
+                    continue
+                inner = self._clean_line(match.group(1))
+                if not inner:
+                    continue
+                if " " not in inner and inner.lower() == inner and inner.isalpha():
+                    continue
+                speeches.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "text": self._clean_line(text[start:end]),
+                        "_speech_type": "quote",
+                        "_content": inner,
+                    }
+                )
+                used_ranges.append((start, end))
+
+        speeches.sort(key=lambda item: item["start"])
+        for idx, item in enumerate(speeches):
+            item["_index"] = idx
+        return speeches
+
+    def _interleave_narrator(
+        self, text: str, speeches: List[Dict[str, Any]], line_starts: List[int]
+    ) -> List[Dict[str, Any]]:
+        utterances: List[Dict[str, Any]] = []
+        cursor = 0
+        for seg in speeches:
+            start, end = seg["start"], seg["end"]
+            if start > cursor:
+                chunk = text[cursor:start]
+                cleaned = self._clean_line(chunk)
+                if cleaned:
+                    utterances.append(
+                        {
+                            "character": "Narrator",
+                            "line": cleaned,
+                            "char_span": [cursor, start],
+                            "source_line": self._line_for_index(cursor),
+                            "attribution": {
+                                "method": "none",
+                                "score": 1.0,
+                                "evidence": "narration",
+                                "name_candidate": None,
+                            },
+                        }
+                    )
+            line = seg.get("text", "")
+            cleaned_line = self._clean_line(line)
+            if cleaned_line:
+                utterances.append(
+                    {
+                        "character": "UNATTRIBUTED",
+                        "line": cleaned_line,
+                        "char_span": [start, end],
+                        "source_line": self._line_for_index(start),
+                        "attribution": {
+                            "method": "none",
+                            "score": 0.0,
+                            "evidence": "",
+                            "name_candidate": None,
+                        },
+                        "_speech_type": seg.get("_speech_type"),
+                        "_content": seg.get("_content", cleaned_line),
+                        "_script_name": seg.get("_script_name"),
+                    }
+                )
+            cursor = max(cursor, end)
+        if cursor < len(text):
+            chunk = text[cursor:]
+            cleaned = self._clean_line(chunk)
+            if cleaned:
+                utterances.append(
+                    {
+                        "character": "Narrator",
+                        "line": cleaned,
+                        "char_span": [cursor, len(text)],
+                        "source_line": self._line_for_index(cursor),
+                        "attribution": {
+                            "method": "none",
+                            "score": 1.0,
+                            "evidence": "narration",
+                            "name_candidate": None,
+                        },
+                    }
+                )
+        return utterances
+
+    def _attribute_all(self, text: str, utterances: List[Dict[str, Any]]) -> None:
+        for utterance in utterances:
+            if utterance.get("character") == "Narrator":
+                continue
+
+            start, end = utterance["char_span"]
+            content = utterance.get("_content") or utterance.get("line")
+            pre_context = text[max(0, start - 240) : start]
+            post_context = text[end : min(len(text), end + 240)]
+            quote_plus_tail = text[start : min(len(text), end + 240)]
+            pre_plus_quote = text[max(0, start - 240) : end]
+
+            best_candidate: Optional[Tuple[float, str, str, str]] = None
+            candidate_scores: Dict[str, Tuple[float, str, str]] = {}
+
+            if utterance.get("_speech_type") == "script":
+                raw_name = utterance.get("_script_name")
+                canonical = self._canonicalize_name(raw_name)
+                if canonical:
+                    candidate_scores[canonical] = (0.95, "script_label", f"label:{raw_name}")
+
+            interruption_match = self.re_intr.search(pre_context + text[start:end] + post_context)
+            if interruption_match:
+                q1 = self._clean_line(interruption_match.group("q1"))
+                q2 = self._clean_line(interruption_match.group("q2"))
+                chosen_q = self._clean_line(content)
+                if chosen_q in (q1, q2):
+                    name = interruption_match.group("name")
+                    canonical = self._canonicalize_name(name)
+                    if canonical:
+                        candidate_scores.setdefault(
+                            canonical,
+                            (0.96, "interruption", f'interruption:{name.strip()}'),
+                        )
+
+            post_match = self.re_post.search(quote_plus_tail)
+            if post_match and self._clean_line(post_match.group("q")) == self._clean_line(content):
+                canonical = self._canonicalize_name(post_match.group("name"))
+                if canonical:
+                    candidate_scores.setdefault(
+                        canonical,
+                        (1.0, "postposed_tag", f'postposed:{post_match.group("name").strip()}'),
+                    )
+
+            pre_match = re.search(
+                r"(?P<name>"
+                + self.NAME_RE
+                + r")\s+(?:"
+                + self._verb_alt
+                + r")(?:\s+\w+)?\s*[\.,;:?!—-]*\s*(?:\"|“|„|«|‹|')(?P<q>.+)$",
+                pre_plus_quote,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if pre_match and self._clean_line(pre_match.group("q")) == self._clean_line(content):
+                canonical = self._canonicalize_name(pre_match.group("name"))
+                if canonical:
+                    candidate_scores.setdefault(
+                        canonical,
+                        (0.98, "preposed_tag", f'preposed:{pre_match.group("name").strip()}'),
+                    )
+
+            for dash in self.DASH_PREFIXES:
+                dash_pattern = re.compile(re.escape(dash) + r"\s*(?P<name>" + self.NAME_RE + r")")
+                dash_match = dash_pattern.search(post_context)
+                if dash_match:
+                    candidate = dash_match.group("name")
+                    window_start = max(0, end)
+                    window_end = min(len(text), end + 120)
+                    vicinity = text[window_start:window_end]
+                    if re.search(self._verb_alt, vicinity, re.IGNORECASE):
+                        canonical = self._canonicalize_name(candidate)
+                        if canonical:
+                            candidate_scores.setdefault(
+                                canonical,
+                                (0.93, "appositive_nearby", f"appositive:{candidate.strip()}"),
+                            )
+
+            if utterance.get("_speech_type") == "emdash":
+                # If em-dash line contains inline "Name —" marker, treat similarly
+                match_name = re.search(self.NAME_RE, pre_context, re.IGNORECASE)
+                if match_name:
+                    canonical = self._canonicalize_name(match_name.group(0))
+                    if canonical:
+                        candidate_scores.setdefault(
+                            canonical,
+                            (0.93, "appositive_nearby", f"emdash-context:{match_name.group(0).strip()}"),
+                        )
+
+            if candidate_scores:
+                best_name, (best_score, method, evidence) = max(
+                    candidate_scores.items(), key=lambda item: item[1][0]
+                )
+                competing = [score for (score, _, _) in candidate_scores.values() if score != best_score]
+                if any(abs(best_score - score) <= 0.02 for score in competing):
+                    best_candidate = None
+                elif best_score >= self.ct:
+                    best_candidate = (best_score, best_name, method, evidence)
+            if best_candidate:
+                score, name, method, evidence = best_candidate
+                utterance["character"] = name
+                utterance["attribution"] = {
+                    "method": method,
+                    "score": float(score),
+                    "evidence": evidence,
+                    "name_candidate": name,
+                }
+            else:
+                utterance["character"] = "UNATTRIBUTED"
+                utterance["attribution"] = {
+                    "method": "none",
+                    "score": 0.0,
+                    "evidence": "",
+                    "name_candidate": None,
+                }
+
+    def _apply_permissive_rules(self, text: str, utterances: List[Dict[str, Any]]) -> None:
+        speech_indices = [idx for idx, u in enumerate(utterances) if u.get("_speech_type")]
+        idx = 0
+        while idx + 1 < len(speech_indices):
+            first_idx = speech_indices[idx]
+            second_idx = speech_indices[idx + 1]
+            first = utterances[first_idx]
+            second = utterances[second_idx]
+            if (
+                first.get("character") not in {"Narrator", "UNATTRIBUTED"}
+                and second.get("character") not in {"Narrator", "UNATTRIBUTED"}
+                and first["character"] != second["character"]
+                and first["attribution"].get("score", 0.0) >= self.ct
+                and second["attribution"].get("score", 0.0) >= self.ct
+            ):
+                a = first["character"]
+                b = second["character"]
+                expected = a
+                for follow_idx in speech_indices[idx + 2 :]:
+                    candidate = utterances[follow_idx]
+                    current = candidate.get("character")
+                    if current not in {"UNATTRIBUTED", a, b}:
+                        break
+                    if current == "UNATTRIBUTED":
+                        candidate["character"] = expected
+                        candidate["attribution"] = {
+                            "method": "alternation",
+                            "score": 0.85,
+                            "evidence": f"alternating:{a}/{b}",
+                            "name_candidate": expected,
+                        }
+                    expected = b if expected == a else a
+                idx += 1
+            idx += 1
+
+        pronoun_map: Dict[str, str] = {}
+        for canonical, aliases in self.aliases.items():
+            for alias in aliases:
+                token = (alias or "").strip().lower()
+                if not token:
+                    continue
+                if token.isalpha():
+                    if token not in pronoun_map:
+                        pronoun_map[token] = canonical
+        if not pronoun_map:
+            return
+        for utterance in utterances:
+            if utterance.get("character") != "UNATTRIBUTED":
+                continue
+            start = utterance["char_span"][0]
+            context = text[max(0, start - 240) : start]
+            tokens = re.findall(r"[A-Za-z]+", context.lower())
+            resolved: Optional[str] = None
+            for token in reversed(tokens):
+                if token in pronoun_map:
+                    resolved = pronoun_map[token]
+                    break
+            if resolved:
+                canonical = self._canonicalize_name(resolved)
+                if canonical:
+                    utterance["character"] = canonical
+                    utterance["attribution"] = {
+                        "method": "pronoun_chain",
+                        "score": 0.82,
+                        "evidence": f"pronoun:{resolved}",
+                        "name_candidate": canonical,
+                    }
+
+    def _enforce_closed_set(self, utterances: List[Dict[str, Any]]) -> None:
+        if not self.known:
+            return
+        valid = {name for name in self.known}
+        for utterance in utterances:
+            character = utterance.get("character")
+            if character in {"Narrator", "UNATTRIBUTED"}:
+                continue
+            if character not in valid:
+                utterance["character"] = "UNATTRIBUTED"
+                utterance["attribution"] = {
+                    "method": "none",
+                    "score": 0.0,
+                    "evidence": "closed_set_filter",
+                    "name_candidate": None,
+                }
+
+    def _wrap_narrator_spans(self, utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not isinstance(self.max_narrator, int) or self.max_narrator <= 0:
+            return utterances
+        wrapped: List[Dict[str, Any]] = []
+        sentence_pattern = re.compile(r".+?(?:[\.\!\?][\"”’']?\s+|$)", re.DOTALL)
+        for utterance in utterances:
+            if utterance.get("character") != "Narrator":
+                wrapped.append(utterance)
+                continue
+            text_span = self._text[utterance["char_span"][0] : utterance["char_span"][1]]
+            if len(self._clean_line(text_span)) <= self.max_narrator:
+                wrapped.append(utterance)
+                continue
+            start_offset = utterance["char_span"][0]
+            accumulator: List[Tuple[int, int]] = []
+            for match in sentence_pattern.finditer(text_span):
+                seg_start = match.start()
+                seg_end = match.end()
+                if not accumulator:
+                    accumulator.append((seg_start, seg_end))
+                else:
+                    last_start, last_end = accumulator[-1]
+                    candidate_length = len(self._clean_line(text_span[last_start:seg_end]))
+                    if candidate_length <= self.max_narrator:
+                        accumulator[-1] = (last_start, seg_end)
+                    else:
+                        accumulator.append((seg_start, seg_end))
+            for seg_start, seg_end in accumulator:
+                segment_text = self._clean_line(text_span[seg_start:seg_end])
+                if not segment_text:
+                    continue
+                absolute_start = start_offset + seg_start
+                absolute_end = start_offset + seg_end
+                wrapped.append(
+                    {
+                        "character": "Narrator",
+                        "line": segment_text,
+                        "char_span": [absolute_start, absolute_end],
+                        "source_line": self._line_for_index(absolute_start),
+                        "attribution": {
+                            "method": "none",
+                            "score": 1.0,
+                            "evidence": "narration",
+                            "name_candidate": None,
+                        },
+                    }
+                )
+        wrapped.sort(key=lambda item: item["char_span"][0])
+        return wrapped
+
+
+class LLMAssistedAttributor:
+    """Optional hook for LLM-based attribution proposals."""
+
+    def __init__(
+        self,
+        known_characters: Optional[List[str]],
+        aliases: Optional[Dict[str, List[str]]],
+        conf_threshold: float = 0.92,
+        batch_size: int = 8,
+    ) -> None:
+        self.known = known_characters or []
+        self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
+        self.conf_threshold = float(conf_threshold)
+        self.batch_size = int(batch_size)
+
+    def propose(self, full_text: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return []
+
+
+def _apply_llm_assist(
+    full_text: str,
+    utterances: List[Dict[str, Any]],
+    known_characters: Optional[List[str]],
+    aliases: Optional[Dict[str, List[str]]],
+    llm_conf_threshold: float,
+    batch_size: int,
+) -> None:
+    pending: List[Dict[str, Any]] = []
+    for utterance in utterances:
+        if utterance.get("character") != "UNATTRIBUTED":
+            continue
+        start, end = utterance["char_span"]
+        context_start = max(0, start - 240)
+        context_end = min(len(full_text), end + 240)
+        pending.append(
+            {
+                "utterance_id": utterance["utterance_id"],
+                "char_span": [start, end],
+                "line": utterance["line"],
+                "context_span": [context_start, context_end],
+            }
+        )
+    if not pending:
+        return
+    agent = LLMAssistedAttributor(known_characters, aliases, conf_threshold=llm_conf_threshold, batch_size=batch_size)
+    proposals = agent.propose(full_text, pending) or []
+    id_map = {u["utterance_id"]: u for u in utterances}
+    name_re = re.compile(DialogueExtractor.NAME_RE)
+    verb_re = re.compile(r"(?:" + "|".join(sorted(map(re.escape, DialogueExtractor.DIALOGUE_VERBS))) + r")", re.IGNORECASE)
+    for proposal in proposals:
+        uid = proposal.get("utterance_id")
+        if not uid or uid not in id_map:
+            continue
+        utterance = id_map[uid]
+        character = proposal.get("character")
+        confidence = float(proposal.get("confidence") or 0.0)
+        if confidence < llm_conf_threshold or not isinstance(character, str):
+            continue
+        if character != "UNATTRIBUTED" and known_characters and character not in known_characters:
+            continue
+        evidence = proposal.get("evidence") or {}
+        valid = True
+        for span_key, regex in (("name_span", name_re), ("verb_span", verb_re)):
+            span = evidence.get(span_key)
+            if not span:
+                continue
+            try:
+                span_start, span_end = int(span[0]), int(span[1])
+            except Exception:
+                valid = False
+                break
+            if span_start < 0 or span_end > len(full_text) or span_start >= span_end:
+                valid = False
+                break
+            if min(abs(span_start - utterance["char_span"][0]), abs(span_end - utterance["char_span"][1])) > 120:
+                valid = False
+                break
+            snippet = full_text[span_start:span_end]
+            if not regex.search(snippet):
+                valid = False
+                break
+        if not valid:
+            continue
+        current_score = float(utterance["attribution"].get("score") or 0.0)
+        if utterance.get("character") not in {"UNATTRIBUTED", "Narrator"} and confidence < current_score + 0.05:
+            continue
+        utterance["character"] = character
+        utterance["attribution"] = {
+            "method": "llm_verified",
+            "score": confidence,
+            "evidence": json.dumps(evidence, ensure_ascii=False),
+            "name_candidate": character if character != "UNATTRIBUTED" else None,
+        }
+
+
+def _write_sidecars(
+    base_output_path: str,
+    utterances: List[Dict[str, Any]],
+    voices_map: Optional[Dict[str, str]],
+    llm_enabled: bool,
+    llm_model: Optional[str],
+    llm_conf_threshold: float,
+) -> Dict[str, str]:
+    base_output_path = _ensure_path_stem(base_output_path)
+    txt_path = f"{base_output_path}_dialogue_marked.txt"
+    json_path = f"{base_output_path}_analysis_dialogue.json"
+
+    lines: List[str] = []
+    if voices_map:
+        lines.append("# voices_map: " + json.dumps(voices_map, ensure_ascii=False))
+    for item in utterances:
+        speaker = item.get("character") or "UNATTRIBUTED"
+        lines.append(f"{speaker}: {item.get('line', '').strip()}")
+    _write_text(txt_path, "\n".join(lines) + ("\n" if lines else ""))
+
+    sanitized: List[Dict[str, Any]] = []
+    confidence_values: List[float] = []
+    summary: Dict[str, Any] = {
+        "utterance_count": 0,
+        "by_character": {},
+        "confidence_stats": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        },
+    }
+
+    for item in utterances:
+        entry = {
+            "utterance_id": item.get("utterance_id"),
+            "character": item.get("character"),
+            "line": item.get("line"),
+            "char_span": list(item.get("char_span", [])),
+            "source_line": item.get("source_line"),
+            "attribution": item.get("attribution", {}),
+        }
+        sanitized.append(entry)
+        speaker = entry.get("character") or "UNATTRIBUTED"
+        summary["by_character"].setdefault(speaker, {"count": 0, "char_total": 0})
+        summary["by_character"][speaker]["count"] += 1
+        summary["by_character"][speaker]["char_total"] += len(entry.get("line") or "")
+        if entry.get("attribution"):
+            confidence_values.append(float(entry["attribution"].get("score") or 0.0))
+
+    summary["utterance_count"] = len(sanitized)
+    for label in ("Narrator", "UNATTRIBUTED"):
+        summary["by_character"].setdefault(label, {"count": 0, "char_total": 0})
+    if confidence_values:
+        summary["confidence_stats"] = {
+            "mean": sum(confidence_values) / len(confidence_values),
+            "median": statistics.median(confidence_values),
+            "min": min(confidence_values),
+            "max": max(confidence_values),
+        }
+
+    payload = {
+        "version": "1.1-hybrid",
+        "source": {"created_utc": _now_utc()},
+        "llm_assist": {
+            "enabled": bool(llm_enabled),
+            "model": llm_model,
+            "conf_threshold": llm_conf_threshold,
+        },
+        "voices_map": voices_map or {},
+        "dialogue": sanitized,
+        "summary": summary,
+    }
+    _write_json(json_path, payload)
+    return {"txt_path": txt_path, "json_path": json_path}
+
+
+def extract_and_save_dialogue(
+    story_text: str,
+    base_output_path: str,
+    *,
+    known_characters: Optional[List[str]] = None,
+    character_aliases: Optional[Dict[str, List[str]]] = None,
+    voices_map: Optional[Dict[str, str]] = None,
+    mode: str = "strict",
+    confidence_threshold: float = 0.90,
+    use_llm_assist: bool = False,
+    llm_conf_threshold: float = 0.92,
+    llm_batch_size: int = 8,
+    max_narrator_chars: Optional[int] = None,
+) -> Dict[str, str]:
+    extractor = DialogueExtractor(
+        known_characters=known_characters,
+        aliases=character_aliases,
+        mode=mode,
+        confidence_threshold=confidence_threshold,
+        max_narrator_chars=max_narrator_chars,
+    )
+    utterances = extractor.extract(story_text or "")
+    if use_llm_assist:
+        _apply_llm_assist(
+            story_text or "",
+            utterances,
+            known_characters,
+            character_aliases,
+            llm_conf_threshold,
+            llm_batch_size,
+        )
+    return _write_sidecars(
+        base_output_path,
+        utterances,
+        voices_map,
+        llm_enabled=use_llm_assist,
+        llm_model=None,
+        llm_conf_threshold=llm_conf_threshold,
+    )
 
 
 # -----------------------------
@@ -2766,6 +3577,7 @@ class App:
         self._last_story_path: str = ""
         self._last_export_dir: str = ""
         self._dialogue_story_text_cache: str = ""
+        self.save_dialogue_btn: Optional[ttk.Button] = None
 
         # --- Aspect controls ---
         self.char_ref_aspect = "1:1"             # used for Character ref sheets
@@ -9347,6 +10159,11 @@ class App:
         row = ttk.Frame(left); row.pack(fill="x")
         ttk.Button(row, text="Load .txt...", command=self._on_load_story).pack(side="left")
         ttk.Button(row, text="Analyze Story", command=self._on_analyze_story).pack(side="left", padx=8)
+        self.save_dialogue_btn = ttk.Button(row, text="Save Dialogue Files…", command=self._on_save_dialogue_files)
+        self.save_dialogue_btn.state(["disabled"])
+        self.save_dialogue_btn.pack(side="left")
+        
+        self._set_dialogue_save_enabled(False)
 
         right = ttk.Frame(outer); right.pack(side="left", fill="both", expand=True, padx=10)
 
@@ -9382,6 +10199,21 @@ class App:
     def _set_status(self, msg: str):
         self.status.set(msg)
 
+    def _set_dialogue_save_enabled(self, enabled: bool) -> None:
+        btn = getattr(self, "save_dialogue_btn", None)
+        if not btn:
+            return
+        try:
+            if enabled:
+                btn.state(["!disabled"])
+            else:
+                btn.state(["disabled"])
+        except Exception:
+            try:
+                btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+            except Exception:
+                pass
+
     def _on_drop_story(self, event):
         paths = self.root.splitlist(event.data)
         for p in paths:
@@ -9394,6 +10226,7 @@ class App:
                 self.input_text_path = p
                 self._last_story_path = p
                 self._set_status("Loaded: " + os.path.basename(p))
+                self._set_dialogue_save_enabled(False)
                 break
 
     def _on_load_story(self):
@@ -9407,6 +10240,7 @@ class App:
         self.input_text_path = p
         self._last_story_path = p
         self._set_status("Loaded: " + os.path.basename(p))
+        self._set_dialogue_save_enabled(False)
 
     def _fallback_extract_entities(self, text: str):
         import re
@@ -9592,7 +10426,9 @@ class App:
         prog = ProgressWindow(self.root, title="Analyze Story")
         prog.set_status("Analyzing story…")
         prog.set_progress(1)
-    
+
+        self._set_dialogue_save_enabled(False)
+
         def worker():
             import traceback
             try:
@@ -9687,17 +10523,90 @@ class App:
                     prog.set_status("Story analyzed.")
                     prog.set_progress(100.0)
                     prog.close()
+                    self._set_dialogue_save_enabled(True)
                 self.root.after(0, _finish_ok)
-    
+
             except Exception as e:
                 traceback.print_exc()
                 def _finish_err():
                     prog.close()
                     messagebox.showerror("Analyze", str(e))
+                    self._set_dialogue_save_enabled(False)
                 self.root.after(0, _finish_err)
-    
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_save_dialogue_files(self):
+        story = ""
+        try:
+            story = self.story_text.get("1.0", "end").strip()
+        except Exception:
+            story = getattr(self, "_last_story_text", "") or ""
+        if not (story or "").strip():
+            messagebox.showinfo("Dialogue", "Load and analyze a story first.")
+            return
+
+        out_dir = filedialog.askdirectory(title="Choose a folder for dialogue files")
+        if not out_dir:
+            return
+
+        src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
+
+        try:
+            self._set_status("Saving dialogue files…")
+        except Exception:
+            pass
+        try:
+            self.root.config(cursor="watch")
+        except Exception:
+            pass
+        try:
+            result = self.analyze_and_emit_dialogue(
+                text=story,
+                out_dir=out_dir,
+                source_text_path=src_path,
+            )
+        except Exception as exc:
+            try:
+                messagebox.showerror("Dialogue", f"Failed to save dialogue files:\n{exc}")
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.root.config(cursor="")
+                except Exception:
+                    pass
+            return
+
+        finally:
+            try:
+                self.root.config(cursor="")
+            except Exception:
+                pass
+
+        marked = (result or {}).get("marked") if isinstance(result, dict) else None
+        js = (result or {}).get("json") if isinstance(result, dict) else None
+        try:
+            self._last_export_dir = out_dir
+        except Exception:
+            pass
+        try:
+            if marked or js:
+                lines = ["Dialogue files saved:"]
+                if marked:
+                    lines.append("- " + marked)
+                if js:
+                    lines.append("- " + js)
+                messagebox.showinfo("Dialogue", "\n".join(lines))
+            else:
+                messagebox.showinfo("Dialogue", "Dialogue extraction completed, but no files were reported.")
+        except Exception:
+            pass
+        try:
+            self._set_status("Dialogue files saved.")
+        except Exception:
+            pass
 
 
     def _render_precis_and_movements(self):
@@ -11690,140 +12599,814 @@ class App:
 
 
     def build_dialogue_cues(self, story_text: str) -> List[DialogueCue]:
-        """
-        Extract narrator vs. spoken lines, attribute speakers, infer emotion.
-        Returns ordered DialogueCue list without timings (filled later).
-        """
+        """Extract dialogue via the hybrid rule-based engine and map to DialogueCue objects."""
+
+        text = story_text or ""
+        if not text.strip():
+            self._dialogue_last_utterances = []
+            self._dialogue_last_metadata = []
+            self._dialogue_last_known_characters = []
+            self._dialogue_last_aliases = {}
+            return []
+
+        analysis_obj = getattr(self, "analysis", {})
+        analysis = analysis_obj if isinstance(analysis_obj, dict) else {}
+
+        def _collect_names() -> List[str]:
+            names: List[str] = []
+            seen: set = set()
+
+            def _push(value: Optional[str]) -> None:
+                if not value:
+                    return
+                key = _title_case_name(value)
+                if key and key not in seen:
+                    seen.add(key)
+                    names.append(key)
+
+            for key in ("characters", "main_characters", "character_list", "cast", "dramatis_personae"):
+                val = analysis.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict):
+                            _push(item.get("name") or item.get("character"))
+                        elif isinstance(item, str):
+                            _push(item)
+
+            scenes = analysis.get("scenes")
+            if isinstance(scenes, list):
+                for scene in scenes:
+                    if isinstance(scene, dict):
+                        chars = scene.get("characters_present") or scene.get("characters")
+                        if isinstance(chars, list):
+                            for char in chars:
+                                _push(char)
+            return names
+
+        known_characters = _collect_names()
+        alias_map: Dict[str, List[str]] = {}
+        alias_data = analysis.get("character_aliases")
+        if isinstance(alias_data, dict):
+            for base, aliases in alias_data.items():
+                if not isinstance(base, str):
+                    continue
+                clean_base = _title_case_name(base)
+                collected: List[str] = []
+                if isinstance(aliases, list):
+                    for alias in aliases:
+                        if isinstance(alias, str) and alias.strip():
+                            collected.append(alias.strip())
+                alias_map[clean_base] = collected
+                if clean_base and clean_base not in known_characters:
+                    known_characters.append(clean_base)
+
+        extractor_mode = getattr(self, "dialogue_extraction_mode", "strict")
+        confidence_threshold = float(getattr(self, "dialogue_confidence_threshold", 0.90))
+        max_narrator_chars = getattr(self, "dialogue_max_narrator_chars", None)
+        if max_narrator_chars is not None:
+            try:
+                max_narrator_chars = int(max_narrator_chars)
+            except Exception:
+                max_narrator_chars = None
+
+        extractor = DialogueExtractor(
+            known_characters=known_characters or None,
+            aliases=alias_map or None,
+            mode=extractor_mode,
+            confidence_threshold=confidence_threshold,
+            max_narrator_chars=max_narrator_chars,
+        )
+        utterances = extractor.extract(text)
+
+        self._dialogue_last_utterances = copy.deepcopy(utterances)
+        self._dialogue_last_metadata = copy.deepcopy(utterances)
+        self._dialogue_last_known_characters = list(known_characters)
+        self._dialogue_last_aliases = dict(alias_map)
+
         cues: List[DialogueCue] = []
-        spans = _extract_quote_spans(story_text or "")
-        used_ranges: List[Tuple[int, int]] = []
-
-        # 1) Handle explicit quoted lines with attribution in tails
-        order = 1
-        for (start, end, quoted, tail) in spans:
-            speaker = _guess_speaker_from_tail(tail) or "Unknown"
-            emotion, emo_conf = _find_inline_emotion(quoted)
-            conf = 0.85 if speaker != "Unknown" else 0.55
+        for order, item in enumerate(utterances, start=1):
+            line = (item.get("line") or "").strip()
+            if not line:
+                continue
+            speaker = item.get("character") or "UNATTRIBUTED"
+            emotion, emotion_conf = _find_inline_emotion(line)
+            score = float((item.get("attribution") or {}).get("score") or 0.0)
+            speaker_conf = 1.0 if speaker == "Narrator" else (score if score > 0 else 0.5)
             cues.append(
                 DialogueCue(
                     order=order,
-                    speaker=("Narrator" if speaker == "Unknown" else speaker),
-                    text=_strip_quotes(quoted),
+                    speaker=speaker,
+                    text=line,
                     emotion=emotion,
-                    speaker_conf=conf,
-                    emotion_conf=emo_conf,
+                    speaker_conf=speaker_conf,
+                    emotion_conf=emotion_conf,
                 )
             )
-            order += 1
-            used_ranges.append((start, end))
 
-        # 2) Try colon/emdash labelled dialogue lines e.g. Alice: "..."
-        lines = _segment_lines(story_text or "")
-        for ln in lines:
-            lab = _guess_speaker_from_label(ln)
-            if not lab:
-                continue
-            m = re.search(r"“([^”]+)”|\"([^\"]+)\"", ln)
-            if m:
-                q = m.group(1) or m.group(2) or ""
-                emotion, emo_conf = _find_inline_emotion(q)
-                cues.append(
-                    DialogueCue(
-                        order=order,
-                        speaker=lab,
-                        text=_strip_quotes(q),
-                        emotion=emotion,
-                        speaker_conf=0.9,
-                        emotion_conf=emo_conf,
-                    )
-                )
-                order += 1
-
-        # 3) Narration lines (non-quoted content)
-        story_wo_quotes = re.sub(r"“[^”]+”|\"[^\"]+\"|\'[^\']+\'", " ", story_text or "")
-        for ln in _segment_lines(story_wo_quotes):
-            t = (ln or "").strip()
-            if not t:
-                continue
-            if len(t) < 3:
-                continue
-            emotion, emo_conf = _find_inline_emotion(t)
-            cues.append(
-                DialogueCue(
-                    order=order,
-                    speaker="Narrator",
-                    text=t,
-                    emotion=emotion,
-                    speaker_conf=0.95,
-                    emotion_conf=emo_conf,
-                )
-            )
-            order += 1
-
-        # 4) De-duplicate by (speaker,text) order while keeping sequence
-        seen = set()
-        uniq: List[DialogueCue] = []
-        for cue in cues:
-            key = (cue.speaker, cue.text)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(cue)
-        return uniq
+        return cues
 
     def emit_marked_text(self, story_text: str, cues: List[DialogueCue]) -> str:
-        """
-        Rewrite text with standard markers on separate lines preceding content.
-        Marker format (easy to parse in Caption_App):
-        [[SPEAKER:<Name>]][[EMOTION:<tag>]]
-        """
-        buf: List[str] = []
+        """Return a simple "Character: line" transcript from DialogueCue records."""
+        lines: List[str] = []
         for cue in cues:
-            sp = cue.speaker if cue.speaker else "Narrator"
-            em = cue.emotion if cue.emotion else "neutral"
-            buf.append(f"[[SPEAKER:{sp}]][[EMOTION:{em}]] {cue.text}")
-        return "\n".join(buf).strip() + "\n"
+            speaker = cue.speaker or "Narrator"
+            text = (cue.text or "").strip()
+            if not text:
+                continue
+            lines.append(f"{speaker}: {text}")
+        return "\n".join(lines).strip() + ("\n" if lines else "")
 
     def save_dialogue_artifacts(self, source_text_path: str, out_dir: str, cues: List[DialogueCue]) -> Dict[str, str]:
-        """
-        Save:
-          - <basename>__dialogue.json  (ordered cues)
-          - <basename>__marked.txt     (tagged transcript)
-        Returns paths.
-        """
+        """Persist the dialogue sidecars using the most recent extractor output."""
         src = Path(source_text_path) if source_text_path else None
-        base = (src.stem if src else "story")
+        base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
 
-        jpath = outp / f"{base}__dialogue.json"
-        tpath = outp / f"{base}__marked.txt"
+        story_text = getattr(self, "_dialogue_story_text_cache", "")
+        if not story_text:
+            story_text = getattr(self, "_last_story_text", "")
+        if not story_text:
+            story_text = ""
 
-        payload = {
-            "version": "1.0",
-            "source_file": str(src) if src else "",
-            "dialogue": [asdict(c) for c in cues],
-        }
-        with open(jpath, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        known_chars = getattr(self, "_dialogue_last_known_characters", [])
+        alias_map = getattr(self, "_dialogue_last_aliases", {})
+        utterances = copy.deepcopy(getattr(self, "_dialogue_last_utterances", []))
+        if not utterances and story_text:
+            max_chars = getattr(self, "dialogue_max_narrator_chars", None)
+            if max_chars is not None:
+                try:
+                    max_chars = int(max_chars)
+                except Exception:
+                    max_chars = None
+            extractor = DialogueExtractor(
+                known_characters=known_chars or None,
+                aliases=alias_map or None,
+                mode=getattr(self, "dialogue_extraction_mode", "strict"),
+                confidence_threshold=float(getattr(self, "dialogue_confidence_threshold", 0.90)),
+                max_narrator_chars=max_chars,
+            )
+            utterances = extractor.extract(story_text)
 
-        story_for_marking = (
-            getattr(self, "_dialogue_story_text_cache", "")
-            or getattr(self, "_last_story_text", "")
-            or (self.analysis or {}).get("_story_text_cache", "")
+        llm_enabled = bool(getattr(self, "enable_dialogue_llm", False))
+        llm_model = getattr(self, "dialogue_llm_model", None)
+        llm_threshold = float(getattr(self, "dialogue_llm_threshold", 0.92))
+        llm_batch = int(getattr(self, "dialogue_llm_batch_size", 8))
+        if llm_enabled and story_text and utterances:
+            _apply_llm_assist(story_text, utterances, known_chars, alias_map, llm_threshold, llm_batch)
+
+        voices_map = getattr(self, "dialogue_voices_map", None)
+        if not isinstance(voices_map, dict):
+            voices_map = None
+
+        result = _write_sidecars(
+            str(outp / base),
+            utterances,
+            voices_map,
+            llm_enabled,
+            llm_model,
+            llm_threshold,
         )
-        if not story_for_marking and hasattr(self, "story_text"):
+        self._dialogue_last_metadata = copy.deepcopy(utterances)
+        return {"json": result["json_path"], "marked": result["txt_path"]}
+
+
+    def _inject_extra_scenes_by_word_gap(self, min_words: int) -> int:
+        """
+        NEW IMPLEMENTATION:
+        Measure the actual words in the story text between consecutive scene markers.
+        For each base scene S_i, consider the story segment from its marker to the next marker
+        (first scene also includes any preface). Insert evenly spaced "extra" scenes so that
+        the average density is at least `min_words` words per image, capped by
+        EXTRA_IMAGES_MAX_PER_SCENE.
+    
+        Returns: number of extra scenes created.
+        """
+        import math
+    
+
+        self._scene_story_segments = {}
+
+        if not self.analysis or not isinstance(self.analysis.get("scenes"), list):
+            return 0
+
+        try:
+            min_words = int(max(1, min_words or 0))
+        except Exception:
+            min_words = 1
+
+    
+        scenes_in = list(self.analysis.get("scenes") or [])
+        if not scenes_in:
+            return 0
+    
+        # Separate base scenes from any previously inserted extras
+        base_scenes = [s for s in scenes_in if isinstance(s, dict)]
+        existing_extras_by_base: dict[str, list[dict]] = {}
+        for s in base_scenes:
+            if not isinstance(s, dict):
+                continue
+            meta = s.get("meta") or {}
+            if meta.get("is_auto_extra") and meta.get("source_scene_id"):
+                existing_extras_by_base.setdefault(meta.get("source_scene_id"), []).append(s)
+
+        anchors = [s for s in base_scenes if not ((s.get("meta") or {}).get("is_auto_extra"))]
+
+        # --- Build per-base-scene story segments using your marker builder ---
+        # Prefer a stored copy of the story to avoid UI access off the main thread.
+
+        cached_story = ""
+        cached_word_total = 0
+        if isinstance(self.analysis, dict):
+            cached_story = (self.analysis.get("_story_text_cache") or "")
             try:
-                story_for_marking = self.story_text.get("1.0", "end").strip()
+                cached_word_total = int(self.analysis.get("_story_word_count_cache") or 0)
             except Exception:
-                story_for_marking = ""
+                cached_word_total = 0
 
-        with open(tpath, "w", encoding="utf-8") as f:
-            f.write(self.emit_marked_text(story_for_marking, cues))
+        story_text = ""
+        try:
+            story_text = getattr(self, "_last_story_text", "") or ""
+        except Exception:
+            story_text = ""
 
-        print(f"[DIALOGUE] wrote {jpath}")
-        print(f"[DIALOGUE] wrote {tpath}")
-        return {"json": str(jpath), "marked": str(tpath)}
+        if not story_text and cached_story:
+            story_text = cached_story
+        if not story_text:
+            try:
+                if getattr(self, "story_text", None):
+
+                    # Fallback only if available; may be called from a worker thread.
+
+                    story_text = self.story_text.get("1.0", "end").strip()
+            except Exception:
+                story_text = ""
+        if not story_text and cached_story:
+            story_text = cached_story
+        if story_text and not getattr(self, "_last_story_text", ""):
+            try:
+                self._last_story_text = story_text
+            except Exception:
+                pass
+
+        segment_by_sid: dict[str, str] = {}
+
+        story_word_total = self._count_words(story_text) if story_text else 0
+        if story_word_total <= 0 and cached_word_total:
+            story_word_total = int(cached_word_total)
+
+
+
+        def _slice_story_evenly(anchor_scenes, text):
+            matches = list(re.finditer(r"\S+", text or ""))
+            total_tokens = len(matches)
+            if total_tokens <= 0:
+                return {}
+            valid_ids = []
+            for sc in anchor_scenes:
+                sid = (sc.get("id") or "").strip()
+                if sid:
+                    valid_ids.append(sid)
+            count = len(valid_ids)
+            if count <= 0:
+                return {}
+            boundaries: List[int] = []
+            for i in range(count + 1):
+                val = int(round(i * total_tokens / count))
+                if boundaries:
+                    val = max(val, boundaries[-1])
+                val = min(val, total_tokens)
+                boundaries.append(val)
+            if boundaries:
+                boundaries[-1] = total_tokens
+            segments: Dict[str, str] = {}
+            for idx, sid in enumerate(valid_ids):
+                start_idx = boundaries[idx]
+                end_idx = boundaries[idx + 1]
+                if end_idx <= start_idx or start_idx >= total_tokens:
+                    continue
+                start_char = 0 if start_idx == 0 else matches[start_idx].start()
+                end_char = len(text) if end_idx >= total_tokens else matches[end_idx].start()
+                seg_text = text[start_char:end_char].strip()
+                if seg_text:
+                    segments[sid] = seg_text
+            return segments
+
+        if story_text and anchors:
+            try:
+                txt_with_markers, markers = self._build_marked_story_and_index(story_text, anchors)
+                lines = txt_with_markers.splitlines()
+
+
+                # sid -> 1-based marker line number
+
+                mline = {}
+                for m in (markers or []):
+                    sid = (m.get("scene_id") or "").strip()
+                    ml = m.get("marker_line_number")
+                    if sid and isinstance(ml, int):
+                        mline[sid] = ml
+
+    
+                ordered = anchors[:]
+    
+                # Preface (text before the first marker) goes to the first scene
+
+                preface_text = ""
+                if ordered:
+                    first_sid = (ordered[0].get("id") or "").strip()
+                    first_ml = mline.get(first_sid)
+                    if isinstance(first_ml, int) and first_ml > 1:
+                        preface_text = "\n".join(lines[:max(0, first_ml - 1)])
+
+                for i, sc in enumerate(ordered):
+                    sid = (sc.get("id") or "").strip()
+                    if not sid:
+                        continue
+                    this_ml = mline.get(sid)
+
+    
+                    # find next scene with a valid marker
+
+                    nxt_ml = None
+                    for k in range(i + 1, len(ordered)):
+                        ml = mline.get((ordered[k].get("id") or "").strip())
+                        if isinstance(ml, int):
+                            nxt_ml = ml
+                            break
+
+    
+                    seg_parts = []
+                    if i == 0 and preface_text:
+                        seg_parts.append(preface_text)
+    
+                    if isinstance(this_ml, int):
+                        # [this_ml + 1 .. nxt_ml - 1], 1-based indices in lines[]
+                        start = min(len(lines), max(1, this_ml + 1))
+                    else:
+                        start = None  # no anchor for this scene; will fall back later
+    
+                    end = len(lines) if nxt_ml is None else max(1, nxt_ml - 1)
+    
+                    if start is not None:
+                        chunk = "\n".join(lines[start - 1 : end])
+                        seg_parts.append(chunk)
+    
+
+                    text_seg = "\n".join([p for p in seg_parts if p]).strip()
+                    if text_seg:
+                        segment_by_sid[sid] = text_seg
+            except Exception:
+
+                # If anything goes wrong, we fall back to per-scene summaries/fractional slices below.
+
+                segment_by_sid = {}
+
+        if story_text and anchors:
+            missing_segment_ids = [
+                (sc.get("id") or "").strip()
+                for sc in anchors
+                if (sc.get("id") or "").strip() and not (segment_by_sid.get((sc.get("id") or "").strip()) or "").strip()
+            ]
+            if missing_segment_ids:
+                fallback_segments = _slice_story_evenly(anchors, story_text)
+                for sid, txt in fallback_segments.items():
+                    if (txt or "").strip():
+                        segment_by_sid[sid] = txt
+                for sid, txt in list(segment_by_sid.items()):
+                    if not (txt or "").strip():
+                        segment_by_sid.pop(sid, None)
+
+
+
+            # If the marker-based slices barely cover the story text, fall back to even spacing.
+
+            if story_word_total > 0 and segment_by_sid:
+                seg_word_total = sum(self._count_words(txt) for txt in segment_by_sid.values())
+                coverage_ratio = seg_word_total / float(story_word_total)
+                if coverage_ratio < 0.6:
+                    even_segments = _slice_story_evenly(anchors, story_text)
+                    if even_segments:
+                        segment_by_sid = {
+                            sid: txt for sid, txt in even_segments.items() if (txt or "").strip()
+                        }
+                        seg_word_total = sum(self._count_words(txt) for txt in segment_by_sid.values())
+                        coverage_ratio = seg_word_total / float(story_word_total) if story_word_total else 1.0
+                        try:
+                            print(
+                                "[extras] coverage fallback: using evenly sliced story text "
+                                f"({coverage_ratio:.0%} of {story_word_total} words)"
+                            )
+                        except Exception:
+                            pass
+
+
+
+
+        # Fallback for any scene missing a segment: use its summary (legacy behavior)
+        for sc in base_scenes:
+            sid = (sc.get("id") or "").strip()
+            if sid and sid not in segment_by_sid and not ((sc.get("meta") or {}).get("is_auto_extra")):
+                segment_by_sid[sid] = (sc.get("what_happens") or sc.get("description") or "").strip()
+
+        base_segments_for_anchor: Dict[str, str] = {}
+        for sc in base_scenes:
+            if not isinstance(sc, dict):
+                continue
+
+            sid = (sc.get("id") or "").strip()
+            if not sid:
+                continue
+            txt = (segment_by_sid.get(sid) or "").strip()
+            if txt:
+                base_segments_for_anchor[sid] = txt
+
+
+        if base_segments_for_anchor:
+            self._scene_story_segments = dict(base_segments_for_anchor)
+
+
+        new_scenes: list[dict] = []
+        created = 0
+        seen_extra_ids = {
+            s.get("id", "")
+            for s in base_scenes
+            if (s.get("meta") or {}).get("is_auto_extra")
+        }
+
+        # Insert extras immediately after their base scenes
+        for sc in base_scenes:
+            if not isinstance(sc, dict):
+                new_scenes.append(sc)
+                continue
+
+            sid = (sc.get("id") or "").strip()
+            if not sid:
+                new_scenes.append(sc)
+                continue
+
+    
+            # Always keep the original (even if it was an extra)
+            new_scenes.append(sc)
+    
+            # Skip: we only generate extras for base scenes
+            if (sc.get("meta") or {}).get("is_auto_extra"):
+                continue
+    
+            text = (segment_by_sid.get(sid) or "").strip()
+            total_words = self._count_words(text)
+            if total_words <= 0:
+                continue
+    
+
+            needed_images = max(1, math.ceil(total_words / float(min_words)))
+            extras_target = max(0, needed_images - 1)
+            if extras_target > EXTRA_IMAGES_MAX_PER_SCENE:
+                extras_target = min(EXTRA_IMAGES_ABS_MAX_PER_SCENE, extras_target)
+            extras_needed = extras_target
+
+    
+            if extras_needed <= 0:
+                continue
+    
+            # Don't duplicate existing extras linked to this base scene
+            existing_for_base = existing_extras_by_base.get(sid, [])
+            to_make = max(0, extras_needed - len(existing_for_base))
+            if to_make <= 0:
+                continue
+    
+            # Base prompt from primary shot
+
+            base_prompt = ""
+            try:
+                prim = self._choose_primary_shot(sid)
+                if prim and prim.prompt:
+                    base_prompt = prim.prompt
+            except Exception:
+                base_prompt = ""
+
+            # Evenly spaced extras across the story segment
+            for j in range(len(existing_for_base) + 1, len(existing_for_base) + to_make + 1):
+                new_id = f"{sid}x{j}"
+                if new_id in seen_extra_ids:
+                    continue
+
+                # pick an excerpt around the j/(extras_needed+1) position of the segment
+                frac = (j / (extras_needed + 1)) if extras_needed > 0 else 0.5
+                excerpt = self._excerpt_text(text, min_words, frac=frac)
+                variant = self._pick_variant_label(sc, j)
+
+    
+                ns = {
+                    "id": new_id,
+                    "title": (sc.get("title") or sid) + f" — extra image {j}",
+                    "what_happens": excerpt or (sc.get("what_happens") or sc.get("description") or ""),
+
+                    "description": sc.get("description", ""),
+                    "characters_present": list(sc.get("characters_present") or []),
+                    "location": sc.get("location", ""),
+                    "key_actions": list(sc.get("key_actions") or []),
+
+                    "tone": sc.get("tone", ""),
+                    "time_of_day": sc.get("time_of_day", ""),
+                    "movement_id": sc.get("movement_id", ""),
+                    "beat_type": sc.get("beat_type", ""),
+
+                    "meta": {
+                        **(sc.get("meta") or {}),
+                        "is_auto_extra": True,
+                        "source_scene_id": sid,
+                        "variant": variant
+                    }
+
+                }
+                new_scenes.append(ns)
+                try:
+                    self.scenes_by_id[new_id] = ns
+                except Exception:
+                    pass
+
+    
+                prompt = self._mutate_prompt_for_extra_image(base_prompt, variant, excerpt, sc)
+                sh_id = "sh_" + hash_str(new_id + variant + prompt)[:10]
+                try:
+
+                    self.shots.append(ShotPrompt(
+                        id=sh_id,
+                        scene_id=new_id,
+                        title=ns["title"],
+
+                        shot_description=f"Auto extra: {variant}",
+                        prompt=prompt,
+                        continuity_notes="auto extra image (word-gap by story markers)"
+
+                    ))
+                except Exception:
+                    pass
+
+
+                seen_extra_ids.add(new_id)
+                if excerpt:
+                    try:
+                        self._scene_story_segments[new_id] = excerpt
+
+                    except Exception:
+                        pass
+                created += 1
+
+        self.analysis["scenes"] = new_scenes
+        return created
+
+
+    def _current_scene_anchor_map(self) -> Dict[str, str]:
+        anchors: Dict[str, str] = {}
+        segments = getattr(self, "_scene_story_segments", None)
+        if isinstance(segments, dict):
+            for sid, txt in segments.items():
+                sid_norm = (sid or "").strip()
+                if sid_norm and (txt or "").strip():
+                    anchors[sid_norm] = txt.strip()
+
+        if isinstance(self.analysis, dict):
+            for sc in (self.analysis.get("scenes") or []):
+                if not isinstance(sc, dict):
+                    continue
+                sid = (sc.get("id") or "").strip()
+                if not sid:
+                    continue
+                if sid not in anchors or not anchors[sid].strip():
+                    txt = (sc.get("what_happens") or sc.get("description") or "").strip()
+                    if txt:
+                        anchors[sid] = txt
+        return anchors
+
+
+
+    def _auto_export_scene_jsons_sync(self, outdir: str, coverage_mode: str = "min") -> None:
+        """
+        Build enriched scene JSONs (no image generation).
+        NEW: 'coverage_mode' controls how many shots get written into each scene:
+             - 'min' → one shot (primary) per scene
+             - 'max' → all available shot prompts for the scene
+        """
+        ensure_dir(outdir)
+        self.output_dir = outdir
+        self._last_export_dir = outdir
+        self._scene_story_segments = {}
+
+        story_text = getattr(self, "_last_story_text", "") or ""
+        if not story_text:
+            story_text = getattr(self, "_dialogue_story_text_cache", "") or ""
+        if not story_text and isinstance(self.analysis, dict):
+            try:
+                story_text = (self.analysis.get("_story_text_cache") or "").strip()
+            except Exception:
+                story_text = ""
+        if not story_text and hasattr(self, "story_text"):
+            try:
+                story_text = self.story_text.get("1.0", "end").strip()
+            except Exception:
+                story_text = ""
+        if story_text:
+            try:
+                self._dialogue_story_text_cache = story_text
+            except Exception:
+                pass
+
+        # --- Auto-insert extra scenes based on word-gap threshold ---
+        try:
+            # If the Shots & Export UI field exists, prefer its current value
+            if (
+                threading.current_thread() is threading.main_thread()
+                and hasattr(self, "min_words_between_images_var")
+            ):
+                self.min_words_between_images = int(self.min_words_between_images_var.get() or "0")
+        except Exception:
+            pass
+        try:
+            mw = int(getattr(self, "min_words_between_images", 0) or 0)
+        except Exception:
+            mw = 0
+        if mw and mw > 0:
+            try:
+                created = self._inject_extra_scenes_by_word_gap(min_words=mw)
+                if created:
+                    print(f"[extras] inserted {created} extra scene(s) based on {mw} words/image")
+            except Exception as _e:
+                print("extras planning failed:", _e)
+
+        anchor_map = self._current_scene_anchor_map()
+        try:
+            self._story_anchor_map_by_outdir[os.path.abspath(outdir)] = dict(anchor_map)
+        except Exception:
+            self._story_anchor_map_by_outdir[os.path.abspath(outdir)] = anchor_map
+
+        titles_map: Dict[str, str] = {}
+        story_title = ""
+        if isinstance(self.analysis, dict):
+            story_title = (self.analysis.get("title") or "").strip()
+            for sc in (self.analysis.get("scenes") or []):
+                if not isinstance(sc, dict):
+                    continue
+                sid = (sc.get("id") or "").strip()
+                if not sid:
+                    continue
+                title_txt = (sc.get("title") or sid).strip()
+                titles_map[sid] = title_txt or sid
+        abs_outdir = os.path.abspath(outdir)
+        self._story_scene_titles_by_outdir[abs_outdir] = titles_map
+        if story_title:
+            self._story_title_by_outdir[abs_outdir] = story_title
+
+        scenes_dir = os.path.join(outdir, SCENE_SUBDIR_NAME)
+
+        ensure_dir(scenes_dir)
+    
+        # Persist analysis at top level
+        if WRITE_ANALYSIS_FILE:
+            try:
+                with open(os.path.join(outdir, ANALYSIS_FILENAME), "w", encoding="utf-8") as f:
+                    json.dump(self._analysis_for_export(), f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+    
+        # Map of shot prompts (include any edits if a UI is present)
+        shot_prompt_map: Dict[str, str] = {}
+        for s in (self.shots or []):
+            txt = None
+            try:
+                panel = self.shot_panels.get(s.id) if hasattr(self, "shot_panels") else None
+                if panel and "prompt_text" in panel:
+                    txt = panel["prompt_text"].get("1.0", "end").strip()
+            except Exception:
+                txt = None
+            shot_prompt_map[s.id] = (txt or s.prompt or "").strip()
+    
+        errors: List[str] = []
+        cov = (coverage_mode or "min").strip().lower()
+        for sc in (self.analysis.get("scenes", []) if self.analysis else []):
+            sid = sc.get("id", "").strip()
+            if not sid:
+                continue
+            try:
+                scene_dir = os.path.join(scenes_dir, sanitize_name(sid))
+                ensure_dir(scene_dir)
+                ensure_dir(os.path.join(scene_dir, SCENE_REFS_DIR))  # make refs/ upfront
+    
+                # Choose primary shot & prompt
+                primary_shot = self._choose_primary_shot(sid)
+                primary_prompt = ""
+                if primary_shot:
+                    primary_prompt = (shot_prompt_map.get(primary_shot.id, primary_shot.prompt) or "").strip()
+                if not primary_prompt:
+                    primary_prompt = (sc.get("what_happens") or sc.get("description") or "").strip()
+    
+                # Build world & conditioning (keeps refs externalized)
+                world = self._build_scene_world_enriched(sc, primary_shot, primary_prompt, shot_prompt_map)
+                final_world = self._apply_conditioning_with_budget(world, sc, primary_shot, primary_prompt)
+    
+                # Externalize refs to disk
+                if ALWAYS_EXTERNALIZE_IMAGES:
+                    final_world = self._externalize_images_to_disk(final_world, scene_dir)
+    
+                # Optional backlink to _analysis.json
+                if WRITE_ANALYSIS_FILE:
+                    try:
+                        rel_analysis = relpath_posix(os.path.join(outdir, ANALYSIS_FILENAME), start=scene_dir)
+                        final_world.setdefault("source", {})["analysis_file"] = rel_analysis
+                    except Exception:
+                        pass
+    
+                # Compose ingredients + fused prompt
+                ingredients = self._build_prompt_ingredients(final_world, sc)
+                fused = self._compose_final_generation_prompt(ingredients)
+                used_boost = False
+                if USE_LLM_FUSION and self.client:
+                    try:
+                        #boosted = LLM.fuse_scene_prompt(self.client, self.llm_model, ingredients, self.global_style, NEGATIVE_TERMS)
+                        boosted = LLM.fuse_scene_prompt(self.client, self.llm_model, ingredients, self.global_style, NEGATIVE_TERMS, self.scene_render_aspect)
+                        if boosted:
+                            fused = boosted
+                            used_boost = True
+                    except Exception:
+                        pass
+                style_bits = self._style_prompt_bits()
+                if style_bits:
+                    if used_boost:
+                        base = (fused or "").strip()
+                        parts = [base] if base else []
+                        parts.extend(style_bits)
+                        fused = "\n\n".join(parts)
+                    elif not any(bit in (fused or "") for bit in style_bits):
+                        fused = "\n\n".join([fused] + style_bits) if fused else "\n\n".join(style_bits)
+                final_world["scene"]["ingredients"] = ingredients
+                final_world["scene"]["fused_prompt"] = fused
+
+                # NEW: write shots according to coverage mode
+                shot_entries: List[Dict[str, Any]] = []
+                if cov == "max":
+                    for sh in (self.shots or []):
+                        if sh.scene_id == sid:
+                            ptxt = (shot_prompt_map.get(sh.id) or sh.prompt or "").strip()
+                            if ptxt:
+                                entry = {"id": sh.id, "title": sh.title, "prompt": ptxt}
+                                if sh.continuity_notes:
+                                    entry["notes"] = sh.continuity_notes
+
+                                shot_entries.append(entry)
+                    if not shot_entries and primary_prompt:
+                        # Fallback: at least one shot
+                        shot_entries = [{"id": (primary_shot.id if primary_shot else f"{sid}-A"),
+                                         "title": (primary_shot.title if primary_shot else "Primary"),
+                                         "prompt": primary_prompt}]
+                else:  # 'min'
+                    if primary_prompt:
+
+                        shot_entries = [{"id": (primary_shot.id if primary_shot else f"{sid}-A"),
+                                         "title": (primary_shot.title if primary_shot else "Primary"),
+                                         "prompt": primary_prompt}]
+
+
+                final_world["scene"]["shots"] = shot_entries
+
+                # Trim & write
+                final_world = self._trim_world_for_size(final_world, max_mb=MAX_SCENE_JSON_MB)
+                out_json = os.path.join(scene_dir, f"{sid}.json")
+                with open(out_json, "w", encoding="utf-8") as f:
+                    json.dump(final_world, f, indent=2, ensure_ascii=False)
+
+            except Exception as e:
+                errors.append(f"{sid}: {e}")
+
+        # Captions + world.json
+        try:
+            self._write_captions_todo(outdir, self.analysis.get("scenes", []), shot_prompt_map)
+        except Exception as me:
+            errors.append("captions_todo: " + str(me))
+        try:
+            self._write_captions_map(outdir, self.analysis.get("scenes", []), shot_prompt_map)
+        except Exception as me:
+            errors.append("captions_map: " + str(me))
+        try:
+            self._world_json_update_from_current(outdir)
+        except Exception as we:
+            errors.append("world.json: " + str(we))
+
+        try:
+            self.analyze_and_emit_dialogue(
+                out_dir=outdir,
+                text=story_text,
+                source_text_path=getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", ""),
+            )
+        except Exception as exc:
+            print(f"[DIALOGUE] analysis/emit failed: {exc}")
+
+        if errors:
+            messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
+        else:
+            messagebox.showinfo("Export", "Export completed to:\n" + outdir)
+
+
 
     def analyze_and_emit_dialogue(self, **kw) -> Dict[str, str]:
         """
