@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "storytools"
+version = "0.1.0"
+description = "Story analysis utilities and CLI"
+authors = [{name = "Terrapin Suite"}]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "Pillow",
+]
+
+[project.scripts]
+storytools = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "story_image_tk_71_2_2_before_light2025_09_24_2"]
