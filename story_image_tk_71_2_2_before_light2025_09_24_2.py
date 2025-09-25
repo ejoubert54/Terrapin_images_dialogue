@@ -3577,6 +3577,7 @@ class App:
         self._last_story_path: str = ""
         self._last_export_dir: str = ""
         self._dialogue_story_text_cache: str = ""
+        self.save_dialogue_btn: Optional[ttk.Button] = None
 
         # --- Aspect controls ---
         self.char_ref_aspect = "1:1"             # used for Character ref sheets
@@ -10158,6 +10159,11 @@ class App:
         row = ttk.Frame(left); row.pack(fill="x")
         ttk.Button(row, text="Load .txt...", command=self._on_load_story).pack(side="left")
         ttk.Button(row, text="Analyze Story", command=self._on_analyze_story).pack(side="left", padx=8)
+        self.save_dialogue_btn = ttk.Button(row, text="Save Dialogue Files…", command=self._on_save_dialogue_files)
+        self.save_dialogue_btn.state(["disabled"])
+        self.save_dialogue_btn.pack(side="left")
+        
+        self._set_dialogue_save_enabled(False)
 
         right = ttk.Frame(outer); right.pack(side="left", fill="both", expand=True, padx=10)
 
@@ -10193,6 +10199,21 @@ class App:
     def _set_status(self, msg: str):
         self.status.set(msg)
 
+    def _set_dialogue_save_enabled(self, enabled: bool) -> None:
+        btn = getattr(self, "save_dialogue_btn", None)
+        if not btn:
+            return
+        try:
+            if enabled:
+                btn.state(["!disabled"])
+            else:
+                btn.state(["disabled"])
+        except Exception:
+            try:
+                btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+            except Exception:
+                pass
+
     def _on_drop_story(self, event):
         paths = self.root.splitlist(event.data)
         for p in paths:
@@ -10205,6 +10226,7 @@ class App:
                 self.input_text_path = p
                 self._last_story_path = p
                 self._set_status("Loaded: " + os.path.basename(p))
+                self._set_dialogue_save_enabled(False)
                 break
 
     def _on_load_story(self):
@@ -10218,6 +10240,7 @@ class App:
         self.input_text_path = p
         self._last_story_path = p
         self._set_status("Loaded: " + os.path.basename(p))
+        self._set_dialogue_save_enabled(False)
 
     def _fallback_extract_entities(self, text: str):
         import re
@@ -10403,7 +10426,9 @@ class App:
         prog = ProgressWindow(self.root, title="Analyze Story")
         prog.set_status("Analyzing story…")
         prog.set_progress(1)
-    
+
+        self._set_dialogue_save_enabled(False)
+
         def worker():
             import traceback
             try:
@@ -10498,17 +10523,90 @@ class App:
                     prog.set_status("Story analyzed.")
                     prog.set_progress(100.0)
                     prog.close()
+                    self._set_dialogue_save_enabled(True)
                 self.root.after(0, _finish_ok)
-    
+
             except Exception as e:
                 traceback.print_exc()
                 def _finish_err():
                     prog.close()
                     messagebox.showerror("Analyze", str(e))
+                    self._set_dialogue_save_enabled(False)
                 self.root.after(0, _finish_err)
-    
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_save_dialogue_files(self):
+        story = ""
+        try:
+            story = self.story_text.get("1.0", "end").strip()
+        except Exception:
+            story = getattr(self, "_last_story_text", "") or ""
+        if not (story or "").strip():
+            messagebox.showinfo("Dialogue", "Load and analyze a story first.")
+            return
+
+        out_dir = filedialog.askdirectory(title="Choose a folder for dialogue files")
+        if not out_dir:
+            return
+
+        src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
+
+        try:
+            self._set_status("Saving dialogue files…")
+        except Exception:
+            pass
+        try:
+            self.root.config(cursor="watch")
+        except Exception:
+            pass
+        try:
+            result = self.analyze_and_emit_dialogue(
+                text=story,
+                out_dir=out_dir,
+                source_text_path=src_path,
+            )
+        except Exception as exc:
+            try:
+                messagebox.showerror("Dialogue", f"Failed to save dialogue files:\n{exc}")
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.root.config(cursor="")
+                except Exception:
+                    pass
+            return
+
+        finally:
+            try:
+                self.root.config(cursor="")
+            except Exception:
+                pass
+
+        marked = (result or {}).get("marked") if isinstance(result, dict) else None
+        js = (result or {}).get("json") if isinstance(result, dict) else None
+        try:
+            self._last_export_dir = out_dir
+        except Exception:
+            pass
+        try:
+            if marked or js:
+                lines = ["Dialogue files saved:"]
+                if marked:
+                    lines.append("- " + marked)
+                if js:
+                    lines.append("- " + js)
+                messagebox.showinfo("Dialogue", "\n".join(lines))
+            else:
+                messagebox.showinfo("Dialogue", "Dialogue extraction completed, but no files were reported.")
+        except Exception:
+            pass
+        try:
+            self._set_status("Dialogue files saved.")
+        except Exception:
+            pass
 
 
     def _render_precis_and_movements(self):
@@ -12613,14 +12711,12 @@ class App:
         for cue in cues:
             speaker = cue.speaker or "Narrator"
             text = (cue.text or "").strip()
-
             if not text:
                 continue
             lines.append(f"{speaker}: {text}")
         return "\n".join(lines).strip() + ("\n" if lines else "")
 
     def save_dialogue_artifacts(self, source_text_path: str, out_dir: str, cues: List[DialogueCue]) -> Dict[str, str]:
-
         """Persist the dialogue sidecars using the most recent extractor output."""
 
         src = Path(source_text_path) if source_text_path else None
@@ -12629,6 +12725,8 @@ class App:
         outp.mkdir(parents=True, exist_ok=True)
         story_text = (
 
+
+        story_text = (
             getattr(self, "_dialogue_story_text_cache", "")
             or getattr(self, "_last_story_text", "")
             or ""
@@ -13310,6 +13408,7 @@ class App:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
         else:
             messagebox.showinfo("Export", "Export completed to:\n" + outdir)
+
 
 
 
