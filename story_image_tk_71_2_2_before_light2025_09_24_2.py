@@ -12722,8 +12722,6 @@ class App:
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
-        story_text = (
-
         story_text = getattr(self, "_dialogue_story_text_cache", "")
         if not story_text:
             story_text = getattr(self, "_last_story_text", "")
