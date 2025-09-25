@@ -158,7 +158,6 @@ def _segment_lines(text: str) -> List[str]:
 def _now_utc() -> int:
     return int(time.time())
 
-
 def _ensure_path_stem(path: str) -> str:
     directory = os.path.dirname(path)
     if directory:
@@ -166,7 +165,6 @@ def _ensure_path_stem(path: str) -> str:
     else:
         os.makedirs(".", exist_ok=True)
     return path
-
 
 def _write_json(path: str, obj: Any) -> None:
     with open(path, "w", encoding="utf-8") as fh:
@@ -785,7 +783,6 @@ class DialogueExtractor:
                     "name_candidate": name,
                 }
             else:
-
                 utterance["character"] = "UNATTRIBUTED"
                 utterance["attribution"] = {
                     "method": "none",
@@ -938,62 +935,47 @@ class DialogueExtractor:
         wrapped.sort(key=lambda item: item["char_span"][0])
         return wrapped
 
-    def __init__(
-        self,
-        known_characters: Optional[List[str]],
-        aliases: Optional[Dict[str, List[str]]],
-        conf_threshold: float = 0.92,
-        batch_size: int = 8,
-        model: Optional[str] = None,
-        client: Optional["OpenAIClient"] = None,
-        scene_rosters: Optional[Dict[str, List[str]]] = None,
-        image_priors: Optional[Dict[str, Dict[str, float]]] = None,
-    ) -> None:
-        self.known = known_characters or []
-        self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
-        self.conf_threshold = float(conf_threshold)
-        self.batch_size = max(1, int(batch_size) if batch_size else 1)
-        if model:
-            self.model = model
-        else:
-            self.model = os.environ.get("DIALOGUE_LLM_MODEL", DEFAULT_LLM_MODEL)
-        self.client = client
-        self._client_error = False
-        self.scene_rosters = scene_rosters or {}
-        self.image_priors = image_priors or {}
 
-    def propose(self, full_text: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not candidates or self._client_error:
-            return []
-        client = self.client
-        if not client:
-            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-            if not api_key:
-                return []
-            org = os.environ.get("OPENAI_ORG_ID") or None
-            try:
-                client = OpenAIClient(api_key, organization=org)  # type: ignore[name-defined]
-            except Exception:
-                self._client_error = True
-                return []
-            self.client = client
+def _prefer_scene_image_prior(
+    candidate_scores: Dict[str, Tuple[float, str, str]],
+    scene_id: Optional[str],
+    scene_rosters: Optional[Dict[str, List[str]]],
+    image_priors: Optional[Dict[str, Dict[str, float]]],
+    *,
+    scene_bias: float = 0.03,
+    image_bias_cap: float = 0.05,
+    image_prior_floor: float = 0.55,
+) -> Optional[Tuple[str, float, str]]:
+    """Bias tied candidates with gentle scene/image nudges."""
 
-        allowed = [name for name in self.known if isinstance(name, str) and name.strip()]
-        if not allowed:
-            allowed = sorted({_title_case_name(name) for name in self.aliases.keys()})
-        allowed = list(dict.fromkeys(allowed))
+    if not candidate_scores:
+        return None
 
-        alias_payload: Dict[str, List[str]] = {}
-        for name in allowed:
-            raw_aliases = sorted(a for a in self.aliases.get(name, set()) if isinstance(a, str) and a.strip())
-            if raw_aliases:
-                alias_payload[name] = raw_aliases
+    roster = set((scene_rosters or {}).get(scene_id or "", []) or [])
+    priors = (image_priors or {}).get(scene_id or "", {}) or {}
 
-        system_prompt = (
-            "You are a dialogue analyst. Given quoted speech or narrator cues, choose the speaker from the closed list only. "
-            "Favor verbs + names near the quote, consider scene/image hints as soft priors, and output JSON with fields: "
-            "utterance_id, character, confidence, evidence (rationale, name_span, verb_span, scene_bias_used, image_bias_used, notes)."
-        )
+    best: Optional[Tuple[str, float, str]] = None
+    for name, (score, method, _info) in candidate_scores.items():
+        bias = 0.0
+        annotations: List[str] = []
+        if name in roster:
+            bias += scene_bias
+            annotations.append("scene")
+        prior_val = 0.0
+        try:
+            prior_val = float(priors.get(name, 0.0) or 0.0)
+        except Exception:
+            prior_val = 0.0
+        if prior_val >= image_prior_floor:
+            bias += min(image_bias_cap, 0.08 * prior_val)
+            annotations.append(f"image={prior_val:.2f}")
+        adjusted = min(1.0, score + bias) if bias > 0.0 else score
+        label = f"{method}+prior({'+'.join(annotations)})" if annotations else method
+        if best is None or adjusted > best[1]:
+            best = (name, adjusted, label)
+    return best
+
+
 
 class LLMAssistedAttributor:
     """Optional hook for LLM-based attribution proposals."""
@@ -1050,8 +1032,26 @@ class LLMAssistedAttributor:
                 alias_payload[name] = raw_aliases
 
         system_prompt = (
-            "You are a dialogue analyst. Attribute quoted speech in prose. Only use characters from this provided list. "
-            "Output JSON with utterance_id, character, confidence, evidence (name_span, verb_span)."
+            "You are a dialogue attribution specialist. Task: for each item, assign the SPEAKER from the CLOSED LIST.\n"
+            "Data per item: {quote, context, scene_characters[], image_priors{name->0..1}, char_span[s,e]}.\n"
+            "Rules of evidence (descending weight):\n"
+            "  1) HARD EVIDENCE in the nearby text (within ~240 chars): a proper NAME next to a DIALOGUE VERB (said/asked/replied/whispered/…)\n"
+            "     either pre-posed (Name said: “...”) or post-posed (“...” said Name). Use these as primary signal.\n"
+            "  2) SOFT CONTEXT: pronoun chains and narrative tags like “he rasped”, “she replied” — resolve using the most\n"
+            "     recently named compatible character in the context window.\n"
+            "  3) SCENE PRIOR (soft): if several candidates remain, prefer someone listed in scene_characters; add a small confidence nudge.\n"
+            "  4) IMAGE PRIOR (soft): if image_priors has a value ≥0.60 for a candidate, add a small confidence nudge.\n"
+            "  5) NEVER invent names. If no candidate is supportable, return UNATTRIBUTED with confidence ≤0.40.\n"
+            "Calibration:\n"
+            "  - Strong verb+name match near the quote → confidence 0.90–0.98.\n"
+            "  - Pronoun resolution with one clear antecedent → 0.82–0.88.\n"
+            "  - Soft priors (scene/image) may raise confidence by ≤0.06 total, never above 0.96, and never without some textual cue.\n"
+            "Output JSON with `results`: each item = {\n"
+            "  utterance_id, character (from allowed list or UNATTRIBUTED), confidence in [0,1],\n"
+            "  evidence: {rationale, name_span:[s,e]|null, verb_span:[s,e]|null, scene_bias_used:bool, image_bias_used:bool, notes}\n"
+            "}\n"
+            "Span coordinates are 0-based indices into the ORIGINAL `context` window (NOT the whole file). If unavailable, return null."
+
         )
 
         outputs: List[Dict[str, Any]] = []
@@ -1243,6 +1243,9 @@ def _apply_llm_assist(
                 "utterance": utterance,
                 "span": (start, end),
                 "phase": "speech",
+
+                "scene_id": scene_id,
+                "context_span": (context_start, context_end),
             }
             continue
         if utterance.get("character") == "Narrator":
@@ -1268,6 +1271,9 @@ def _apply_llm_assist(
                     "utterance": utterance,
                     "span": (seg_start, seg_end),
                     "phase": "narration",
+                    "scene_id": scene_id,
+                    "context_span": (payload["context_span"][0], payload["context_span"][1]),
+
                 }
 
     if not candidates:
@@ -1300,8 +1306,6 @@ def _apply_llm_assist(
         if not isinstance(character, str):
             continue
         confidence = float(proposal.get("confidence") or 0.0)
-        if confidence < llm_conf_threshold:
-            continue
         canonical = alias_lookup.get(character.lower(), character)
         if canonical != "UNATTRIBUTED" and known_characters and canonical not in known_characters:
             continue
@@ -1309,6 +1313,19 @@ def _apply_llm_assist(
         if not (isinstance(evidence.get("name_span"), (list, tuple)) and isinstance(evidence.get("verb_span"), (list, tuple))):
             continue
         valid = True
+        context_window = mapping.get("context_span")
+        if (
+            isinstance(context_window, (tuple, list))
+            and len(context_window) == 2
+            and context_window[0] is not None
+            and context_window[1] is not None
+        ):
+            context_start, context_end = int(context_window[0]), int(context_window[1])
+        else:
+            context_start, context_end = mapping["span"]
+        context_length = max(0, int(context_end) - int(context_start))
+        absolute_spans: Dict[str, List[int]] = {}
+
         for span_key, regex in (("name_span", name_re), ("verb_span", verb_re)):
             span = evidence.get(span_key)
             if not span:
@@ -1318,13 +1335,18 @@ def _apply_llm_assist(
             except Exception:
                 valid = False
                 break
-            if span_start < 0 or span_end > len(full_text) or span_start >= span_end:
+
+            abs_start, abs_end = span_start, span_end
+            if context_length and 0 <= span_start < span_end <= context_length:
+                abs_start = int(context_start) + span_start
+                abs_end = int(context_start) + span_end
+            if abs_start < 0 or abs_end > len(full_text) or abs_start >= abs_end:
                 valid = False
                 break
-            if min(abs(span_start - mapping["span"][0]), abs(span_end - mapping["span"][1])) > 160:
+            if min(abs(abs_start - mapping["span"][0]), abs(abs_end - mapping["span"][1])) > 160:
                 valid = False
                 break
-            snippet = full_text[span_start:span_end]
+            snippet = full_text[abs_start:abs_end]
             if regex is name_re:
                 if not regex.search(snippet):
                     valid = False
@@ -1333,8 +1355,42 @@ def _apply_llm_assist(
                 if not regex.search(snippet):
                     valid = False
                     break
+            absolute_spans[span_key] = [abs_start, abs_end]
         if not valid:
             continue
+        evidence.update(absolute_spans)
+        proposal["evidence"] = evidence
+        if confidence < llm_conf_threshold:
+            if canonical == "UNATTRIBUTED":
+                continue
+            scene_id_local = mapping.get("scene_id")
+            nudged = _prefer_scene_image_prior(
+                {canonical: (confidence, "llm", "llm")},
+                scene_id_local,
+                scene_rosters if llm_scene_bias else {},
+                image_priors if llm_image_bias else {},
+                scene_bias=0.03,
+                image_bias_cap=0.05,
+                image_prior_floor=0.60,
+            )
+            if not nudged or nudged[0] != canonical or nudged[1] < llm_conf_threshold:
+                continue
+            confidence = nudged[1]
+            roster_local = (scene_rosters if llm_scene_bias else {}).get(scene_id_local or "", []) or []
+            prior_map = (image_priors if llm_image_bias else {}).get(scene_id_local or "", {}) or {}
+            try:
+                prior_value = float(prior_map.get(canonical, 0.0) or 0.0)
+            except Exception:
+                prior_value = 0.0
+            evidence_notes = evidence.get("notes") or ""
+            if evidence_notes:
+                evidence_notes += " | "
+            evidence_notes += f"nudge:{nudged[2]}"
+            evidence["notes"] = evidence_notes
+            evidence["scene_bias_used"] = canonical in roster_local
+            evidence["image_bias_used"] = prior_value >= 0.60
+            proposal["confidence"] = confidence
+            proposal["evidence"] = evidence
         current_score = float((utterance.get("attribution") or {}).get("score") or 0.0)
         if utterance.get("character") not in {"UNATTRIBUTED", "Narrator"} and confidence < current_score + 0.05:
             continue
@@ -1343,8 +1399,9 @@ def _apply_llm_assist(
             "rationale": evidence.get("rationale"),
             "name_span": evidence.get("name_span"),
             "verb_span": evidence.get("verb_span"),
-            "scene_bias_used": evidence.get("scene_bias_used"),
-            "image_bias_used": evidence.get("image_bias_used"),
+            "scene_bias_used": bool(evidence.get("scene_bias_used")),
+            "image_bias_used": bool(evidence.get("image_bias_used")),
+
             "notes": evidence.get("notes"),
         }
         utterance["attribution"] = {
@@ -1742,7 +1799,8 @@ def extract_and_save_dialogue(
     voices_map: Optional[Dict[str, str]] = None,
     mode: str = "strict",
     confidence_threshold: float = 0.90,
-    use_llm_assist: bool = False,
+    use_llm_assist: bool = True,
+
     llm_conf_threshold: float = 0.83,
     llm_batch_size: int = 8,
     max_narrator_chars: Optional[int] = None,
@@ -1807,16 +1865,6 @@ DEFAULT_IMAGE_SIZE   = "1024x1024"
 IMAGE_SIZE_CHOICES   = ["1024x1024", "1536x1024", "1024x1536", "auto"]
 GLOBAL_STYLE_DEFAULT = "Photorealistic cinematic still"
 
-# -----------------------------
-# Config
-# -----------------------------
-DEFAULT_LLM_MODEL    = "gpt-5-chat-latest"
-LLM_MODEL_CHOICES    = [DEFAULT_LLM_MODEL, "gpt-5", "gpt-5-mini"]
-OPENAI_IMAGE_MODEL   = "gpt-image-1"
-DEFAULT_IMAGE_SIZE   = "1024x1024"
-IMAGE_SIZE_CHOICES   = ["1024x1024", "1536x1024", "1024x1536", "auto"]
-GLOBAL_STYLE_DEFAULT = "Photorealistic cinematic still"
-
 GLOBAL_STYLE_CHOICES = [GLOBAL_STYLE_DEFAULT, "3D cinematic render", "Graphic novel / inked", "No global style"]
 NEGATIVE_TERMS_POLICY = (
     "no text, no watermark, no logos, no nudity, no sexual content, no gore, no gratuitous violence, "
@@ -1835,9 +1883,7 @@ NEGATIVE_TERMS_QUALITY = (
 # The single constant used throughout the app:
 NEGATIVE_TERMS = ", ".join([NEGATIVE_TERMS_POLICY, NEGATIVE_TERMS_QUALITY])
 
-
 DEFAULT_ASPECT       = "21:9"
-
 
 # --- Aspect presets (new) ---
 ASPECT_CHOICES = ["1:1", "3:2", "2:3", "16:9", "21:9", "9:16"]
@@ -1993,7 +2039,6 @@ def scene_fusion_system(aspect_label: str) -> str:
         '{ \"prompt\": \"...\" }'
     )
 
-
 def make_scene_fusion_user(ingredients: Dict[str, Any], global_style: str, negative_terms: str) -> str:
     """
     User content for the scene‑level fusion pass.
@@ -2009,6 +2054,7 @@ def make_scene_fusion_user(ingredients: Dict[str, Any], global_style: str, negat
     parts.append("Cast (all must appear):\n")
     cast_block = ingredients.get("cast", [])
     parts.append(json.dumps(cast_block, ensure_ascii=False, indent=2)); parts.append("\n\n")
+
 
     hair_lines: List[str] = []
     ref_locked: List[str] = []
@@ -2137,7 +2183,6 @@ def _ensure_assets_dir(world_path: str) -> str:
     os.makedirs(dest, exist_ok=True)
     return dest
 
-
 def _sha1_short(path: str) -> str:
     h = hashlib.sha1()
     try:
@@ -2260,7 +2305,6 @@ def _image_palette_and_luma(img_path: str, max_colors: int = 6) -> Tuple[List[st
     except Exception:
         return [], 0.5
 
-
 def _register_asset(world_obj: Dict[str, Any], img_path: str,
                     *, entity_type: str = "", entity_name: str = "") -> Dict[str, Any]:
     reg = world_obj.setdefault("assets_registry", [])
@@ -2344,7 +2388,6 @@ def _contrast_norm(img: Image.Image) -> float:
 
 
 def _colorfulness(img: Image.Image) -> float:
-
     try:
         im = img.convert("RGB").resize((128, 128))
         pixels = list(im.getdata())
@@ -2360,7 +2403,6 @@ def _colorfulness(img: Image.Image) -> float:
         return max(0.0, min(1.0, val / 110.0))
     except Exception:
         return 0.5
-
 
 def _edge_density(img: Image.Image) -> float:
     try:
@@ -2533,7 +2575,6 @@ def _read_json(path: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root at {path} is not an object")
     return data
-
 
 def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
@@ -2990,6 +3031,7 @@ def _maybe_expand_scenes(analysis_path: str,
                          extra_dry_run: bool = False):
     """Expand a captions_map using an analysis JSON on disk.
 
+
     Loads the provided analysis and captions files, performs deterministic
     scene expansion plus optional extra-shot scheduling, and writes the
     results back unless ``dry_run`` is set. Progress and summaries are emitted
@@ -3002,7 +3044,6 @@ def _maybe_expand_scenes(analysis_path: str,
         cmap = _read_json(captions_path)
     except Exception as e:
         msg = f"[expand-scenes] skipped: load error: {e}"
-
         print(msg)
         LAST_EXPAND_SCENES_STATUS = msg
         LAST_EXPAND_SCENES_REPORT = None
@@ -3012,6 +3053,7 @@ def _maybe_expand_scenes(analysis_path: str,
         updated_cmap, report = expand_scenes_to_analysis(analysis, cmap)
     except Exception as e:
         msg = f"[expand-scenes] failed: {e}"
+
         print(msg)
         LAST_EXPAND_SCENES_STATUS = msg
         LAST_EXPAND_SCENES_REPORT = None
@@ -3394,9 +3436,6 @@ ANALYZE_SYSTEM = (
     "key_actions, tone, time_of_day, movement_id, beat_type, plot_devices (list of {name, event, notes}), is_plot_device_intro (bool), plot_device_focus (device name or \"\")."
 )
 
-
-
-
 def make_analyze_user(story: str) -> str:
     parts = []
     parts.append("Story (may be expository / no proper names):\n---\n")
@@ -3451,40 +3490,6 @@ def make_analyze_user(story: str) -> str:
         "}\n"
     )
     return "".join(parts)
-
-
-
-
-SHOTS_SYSTEM = (
-    "You are a seasoned storyboard artist and cinematographer. Respond with a SINGLE JSON object. "
-    "Return a SINGLE JSON OBJECT. No markdown/code fences/prose. "
-    "For each scene, propose 1–3 **expansive** shot prompts (120–220 words each) that combine:"
-    " composition rules (framing, balance, depth layers), lens+camera height, blocking, gesture, "
-    "light (key/fill/rim, color temperature, direction), atmosphere (haze, rain, dust, fog), palette, "
-    "texture, dynamic range, contrast handling, and mood. "
-    "Always assume WIDE aspect 21:9. Avoid proper-noun camera brand jargon. "
-    "Respect constraints: no text, no watermark, no logos. Return JSON only."
-)
-def shots_system(aspect_label: str) -> str:
-    return (
-        "You are a seasoned storyboard artist and cinematographer. Respond with a SINGLE JSON object. "
-        "Return a SINGLE JSON OBJECT. No markdown/code fences/prose. "
-        "For each scene, propose 1–3 expansive shot prompts (120–220 words each) that combine: "
-        "composition rules (framing, balance, depth layers), lens+camera height, blocking, gesture, "
-        "light (key/fill/rim, color temperature, direction), atmosphere (haze, rain, dust, fog), palette, "
-        "texture, dynamic range, contrast handling, and mood. "
-        f"Assume aspect {aspect_label}. Avoid proper-noun camera brand jargon. "
-        # Exterior/vehicle bias without dropping character coverage
-        "When ships/vehicles/aircraft/rovers or large exterior scale are present or implied, ensure at least "
-        "one shot is an EXTERIOR/ENVIRONMENTAL action view that favors the craft/environment over people; "
-        "if people appear, keep them small in frame or silhouetted (do not center faces). "
-        "Use motion cues when appropriate (thruster plumes, starfield parallax, contrails, dust trails, motion blur). "
-        # Composition guardrails to avoid 'sheepish portraits'
-        "Hard avoid: direct‑to‑camera gaze, selfie/posed portraits, centered head‑and‑shoulders, mugshot symmetry. "
-        "Favor off‑axis or over‑the‑shoulder viewpoints, layered depth (foreground/midground/background), and "
-        "environmental scale cues. Respect constraints: no text, no watermark, no logos. Return JSON only."
-    )
-
 
 
 SHOTS_SYSTEM = (
@@ -3695,10 +3700,10 @@ def make_loc_baseline_user(summary: str, name: str, description: str, mood: str,
     parts.append("Mood: "); parts.append(mood or "(none)"); parts.append("\n")
     parts.append("Lighting: "); parts.append(lighting or "(none)"); parts.append("\n")
     parts.append("Key props: "); parts.append(key_props or "(none)"); parts.append("\n")
-
     parts.append("Visual cues from photos: "); parts.append(cues or "(none)"); parts.append("\n\n")
     parts.append('Return JSON:\n{ "prompt": "" }')
     return "".join(parts)
+
 
 IMAGE_DESC_SYSTEM = (
     "You are a character visual analyst. From the photo(s), extract compact 'visual DNA' suitable for generation prompts: "
@@ -3745,7 +3750,6 @@ def make_world_extract_user(story_text: str, prior_world: Optional[dict]) -> str
     parts.append("Return JSON with keys: title, logline, story_precis, story_summary, main_characters, locations, structure, scenes.")
     return "\n\n".join(parts)
 
-
 # -----------------------------
 # Prompt helpers
 # -----------------------------
@@ -3785,7 +3789,6 @@ def build_view_prompt_from_baseline(baseline: str, view_key: str, global_style: 
     if abs(emiss_val) >= 0.15:
         out = out + "\nEmissive lighting: " + emissive_language(emiss_val)
     return out
-
 def build_loc_view_prompt_from_baseline(baseline: str, view_key: str, global_style: str) -> str:
     v = LOC_VIEWS_DEF[view_key]
     tail = (
@@ -3828,11 +3831,13 @@ def exposure_language(level: float) -> str:
 
 def emissive_language(level: float) -> str:
     """Prompt-only hint for diegetic/practical light sources."""
+
     try:
         l = _clamp(float(level), -1.0, 1.0)
     except Exception:
         l = 0.0
     if l >= 0.66:
+
         return ("pronounced diegetic glows from instrument panels and screens; "
                 "soft bloom; gentle rim-light; protect highlights")
     if l >= 0.33:
@@ -3860,6 +3865,7 @@ def compose_location_dna(l: LocationProfile, max_len: int = 3500) -> str:
         if l.lighting: parts.append("Lighting: " + l.lighting)
         if l.key_props: parts.append("Key props: " + l.key_props)
     if l.visual_cues_from_photos: parts.append("Visual cues: " + l.visual_cues_from_photos)
+
     dna = " ".join(parts)
     dna = re.sub(r"\s+", " ", dna).strip()
     return dna[:max_len]
@@ -3894,6 +3900,7 @@ HAIR_DESCRIPTOR_PATTERNS: List[tuple[str, str]] = [
     ("white hair", r"\bwhite(?:\s+hair|[- ]haired)?\b"),
 ]
 
+
 def extract_hair_descriptor(text: str) -> Optional[str]:
     """Return a concise hair descriptor (e.g., 'blonde hair') if one is present."""
     if not text:
@@ -3914,8 +3921,6 @@ def join_clause(items: List[str]) -> str:
     if len(filtered) == 2:
         return f"{filtered[0]} and {filtered[1]}"
     return ", ".join(filtered[:-1]) + f", and {filtered[-1]}"
-
-
 
 def compose_master_scene_prompt(base_prompt: str,
                                 sc: Dict[str,Any],
@@ -3996,7 +4001,6 @@ class LLM:
         aspect_label: str | None = None,
         **kwargs,
     ) -> List["ShotPrompt"]:
-
         """
         Compatibility version:
         - Accepts new names (characters_ctx/locations_ctx) and old names (character_blocks/location_blocks).
@@ -5871,6 +5875,7 @@ class App:
             "characters": strip_data_uris(rg_chars),
             "locations":  strip_data_uris(rg_locs),
         }
+
         w["scene"] = scene
         if size_bytes(w) <= limit:
             return w
@@ -7199,6 +7204,63 @@ class App:
         return {"preset": None, "id": "", "name": fallback_name}
 
 
+        # 3) Locations
+        raw_locs = (self.world.get("locations") or {})
+        if isinstance(raw_locs, list):
+            loc_map = { (d.get("name","") or "").strip(): d for d in raw_locs if isinstance(d, dict) and d.get("name") }
+        else:
+            loc_map = { (k or "").strip(): (v or {}) for k, v in raw_locs.items() }
+    
+        for nm_raw, entry in loc_map.items():
+            nm = (nm_raw or "").strip()
+            if not nm:
+                continue
+            target_name = state_locs_by_sn.get(sanitize_name(nm)) or nm
+            l = self.locations.get(target_name)
+            if not l and create_missing:
+                l = LocationProfile(name=target_name, description=entry.get("description",""))
+                self.locations[target_name] = l
+            if not l:
+                continue
+            baseline = entry.get("sheet_base_prompt") or entry.get("dna") or entry.get("visual_dna") or entry.get("baseline") or ""
+            if baseline and not l.sheet_base_prompt:
+                l.sheet_base_prompt = baseline
+            if entry.get("description") and not l.description:
+                l.description = entry["description"]
+            cues_raw = entry.get("visual_cues_from_photos")
+            if cues_raw:
+                txt, cues_list = _normalize_visual_cues_value(cues_raw)
+                existing_list = getattr(l, "visual_cues_from_photos_list", []) or []
+                combined = list(dict.fromkeys(existing_list + cues_list)) if cues_list else existing_list
+                if combined:
+                    l.visual_cues_from_photos_list = combined
+                    l.visual_cues_from_photos = "; ".join(combined)
+                elif txt and not l.visual_cues_from_photos:
+                    l.visual_cues_from_photos = txt
+            else:
+                if not getattr(l, "visual_cues_from_photos_list", None):
+                    l.visual_cues_from_photos_list = []
+            ids = list(dict.fromkeys(entry.get("reference_image_ids") or []))
+            for aid in ids:
+                if aid not in l.reference_images:
+                    l.reference_images.append(aid)
+            pri = (entry.get("primary_reference_id") or "").strip()
+            if pri:
+                l.primary_reference_id = pri
+            if not l.primary_reference_id and l.reference_images:
+                l.primary_reference_id = l.reference_images[0]
+            traits = entry.get("dna_traits")
+            if isinstance(traits, dict):
+                if not isinstance(l.dna_traits, dict):
+                    l.dna_traits = {}
+                for key, value in traits.items():
+                    if key not in l.dna_traits:
+                        l.dna_traits[key] = value
+                    elif isinstance(l.dna_traits.get(key), dict) and isinstance(value, dict):
+                        for subk, subv in value.items():
+                            if subk not in l.dna_traits[key]:
+                                l.dna_traits[key][subk] = subv
+
     def _load_user_styles(self) -> None:
         styles_list = []
         if isinstance(self.world, dict):
@@ -7306,10 +7368,10 @@ class App:
                 if isinstance(item, dict) and item.get("id") == asset_id:
                     pth = item.get("path")
                     return pth if isinstance(pth, str) else ""
+
         except Exception:
             return ""
         return ""
-
 
     def _find_profile_by_name(self, name: str, kind_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[Any]]:
         target = (name or "").strip()
@@ -7832,6 +7894,7 @@ class App:
         self._build_tab_locations()
         self._build_tab_shots_export()
 
+
         try:
             if isinstance(self.analysis, dict):
                 title = self.analysis.get("title")
@@ -8071,58 +8134,23 @@ class App:
         sid = (getattr(self, "selected_style_id", "") or "").strip()
         styles = []
         try:
-            styles = (self.world or {}).get("style_presets") or []
-        except Exception:
-            styles = []
-        if sid:
-            for preset in styles:
-                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    name = (preset.get("name") or preset.get("id") or "").strip()
-                    return preset, name
-        return None, ""
-
-
-    def _style_prompt_bits(self) -> List[str]:
-        bits: List[str] = []
-        preset, _ = self._resolve_selected_style()
-        if not preset:
-            return bits
-        desc = (preset.get("style_prompt") or "").strip()
-        if desc:
-            bits.append("Style: " + desc)
-        palette = [c for c in (preset.get("palette") or []) if c][:4]
-        if palette:
-            bits.append("Style palette: " + ", ".join(palette))
-        return bits
-
-
-    def _current_style_snapshot(self) -> Dict[str, Any]:
-        preset, preset_name = self._resolve_selected_style()
-        if preset:
-            return {
-                "preset": preset,
-                "id": preset.get("id", ""),
-                "name": preset_name or preset.get("name", ""),
-            }
-        fallback_name = getattr(self, "selected_style_name", "") or getattr(self, "global_style", "")
-        return {"preset": None, "id": "", "name": fallback_name}
-
-
-    def _load_user_styles(self) -> None:
-        styles_list = []
-        if isinstance(self.world, dict):
-            raw = self.world.get("style_presets")
-            if isinstance(raw, list):
-                styles_list = raw
-        self._user_styles = styles_list
-
-        payload = _read_json_safely(_styles_store_path())
-        if isinstance(payload, dict):
-            source = payload.get("styles") or payload.get("style_presets") or []
-        elif isinstance(payload, list):
-            source = payload
-        else:
-            source = []
+            prompt_for_api = self._augment_prompt_for_render(prompt)
+            if refs:
+                return self.client.generate_images_b64_with_refs(
+                    model=self.image_model,
+                    prompt=prompt_for_api,
+                    size=target_size,
+                    ref_data_uris=refs,
+                    n=n
+                )
+            return self.client.generate_images_b64(
+                model=self.image_model,
+                prompt=prompt_for_api,
+                size=target_size,
+                n=n
+            )
+        except Exception as e:
+            raise RuntimeError(f"Image generation failed ({target_size}): {e}") from e
 
         existing_by_id: Dict[str, Dict[str, Any]] = {}
         for entry in self._user_styles:
@@ -8131,57 +8159,104 @@ class App:
                 if sid:
                     existing_by_id[sid] = entry
 
-        for entry in source:
-            if not isinstance(entry, dict):
-                continue
-            sid = (entry.get("id") or "").strip()
-            if sid and sid in existing_by_id:
-                try:
-                    existing_by_id[sid].update(entry)
-                except Exception:
-                    pass
-            else:
-                self._user_styles.append(entry)
-                if sid:
-                    existing_by_id[sid] = entry
-
-        if isinstance(self.world, dict):
-            self.world["style_presets"] = self._user_styles
-
-
-    def _save_user_styles(self) -> None:
+    def _current_exposure_settings(self) -> tuple[float, bool, float]:
         try:
-            styles = [s for s in getattr(self, "_user_styles", []) if isinstance(s, dict)]
-            payload = {"styles": styles}
-            path = _styles_store_path()
-            ensure_dir(os.path.dirname(path) or ".")
-            _write_json_atomic(path, payload)
-        except Exception as exc:
-            try:
-                print(f"[style] warning: failed to save user styles: {exc}")
-            except Exception:
-                pass
-
-
-    def _merge_styles_for_dropdown(self) -> None:
-        try:
-            if not isinstance(self.world, dict):
-                return
-            styles = getattr(self, "_user_styles", None)
-            if styles is None:
-                styles = []
-            current = self.world.setdefault("style_presets", [])
-            if current is not styles:
-                self.world["style_presets"] = styles
-            self._refresh_style_dropdown(preserve_selection=False)
+            bias = float(getattr(self, "exposure_bias", EXPOSURE_BIAS))
         except Exception:
+            bias = float(EXPOSURE_BIAS)
+        try:
+            post = bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP))
+        except Exception:
+            post = bool(EXPOSURE_POST_TONEMAP)
+        try:
+            emiss = float(getattr(self, "emissive_level", EMISSIVE_LEVEL))
+        except Exception:
+            emiss = float(EMISSIVE_LEVEL)
+        return bias, post, emiss
+
+    def _augment_prompt_for_render(self, prompt: str) -> str:
+        bias, _, emiss = self._current_exposure_settings()
+        try:
+            base = str(prompt or "")
+        except Exception:
+            base = ""
+        cleaned_lines: list[str] = []
+        for line in base.splitlines():
+            strip = line.strip().lower()
+            if strip.startswith("exposure control:") or strip.startswith("emissive lighting:"):
+                continue
+            cleaned_lines.append(line)
+        base_txt = "\n".join(cleaned_lines).strip()
+        parts: list[str] = [base_txt] if base_txt else []
+        parts.append("Exposure control: " + exposure_language(bias))
+        if abs(emiss) >= 0.15:
+            parts.append("Emissive lighting: " + emissive_language(emiss))
+        augmented = "\n".join(parts)
+        try:
+            print(f"[prompt] exposure={bias:+.2f} emissive={emiss:+.2f}")
+        except Exception:
+            pass
+        return augmented
+
+    def _process_generated_image(
+        self, raw: bytes, ext: str | None = None, *, need_image: bool = False
+    ) -> tuple[bytes, Optional["Image.Image"]]:
+        bias, post, _ = self._current_exposure_settings()
+        processed = raw
+        img_obj: Optional["Image.Image"] = None
+        log_msg = None
+        if post and abs(bias) >= 0.05:
             try:
-                self._refresh_style_dropdown(preserve_selection=False)
+                buf = io.BytesIO(raw)
+                with Image.open(buf) as im:
+                    im.load()
+                    tonemapped = apply_exposure_tonemap(im, bias)
+                    out_buf = io.BytesIO()
+                    fmt = None
+                    if ext:
+                        fmt = {
+                            ".png": "PNG",
+                            ".jpg": "JPEG",
+                            ".jpeg": "JPEG",
+                            ".webp": "WEBP",
+                        }.get(ext.lower())
+                    if not fmt:
+                        fmt = tonemapped.format or "PNG"
+                    save_img = tonemapped
+                    if fmt == "JPEG" and tonemapped.mode == "RGBA":
+                        save_img = tonemapped.convert("RGB")
+                    save_img.save(out_buf, format=fmt)
+                    processed = out_buf.getvalue()
+                    img_obj = tonemapped.copy()
+                    log_msg = f"[exposure] post tone-map applied (bias={bias:+.2f})"
+            except Exception as e:
+                log_msg = f"[exposure] tone-map skipped: {e}"
+                img_obj = None
+                processed = raw
+        if need_image and img_obj is None:
+            try:
+                buf = io.BytesIO(processed)
+                with Image.open(buf) as im:
+                    im.load()
+                    img_obj = im.copy()
+            except Exception:
+                img_obj = None
+        if log_msg:
+            try:
+                print(log_msg)
             except Exception:
                 pass
+        return processed, img_obj
+
+    def _process_image_batch(self, imgs: list[bytes], ext: str | None = None) -> list[bytes]:
+        processed: list[bytes] = []
+        for b in imgs or []:
+            pb, _ = self._process_generated_image(b, ext=ext, need_image=False)
+            processed.append(pb)
+        return processed
 
 
-    def _load_thumb(self, path: str, max_side: int = 160):
+    def _build_ui(self):
         """
         Load a thumbnail ImageTk.PhotoImage, caching in self._thumb_cache.
         Returns (imgtk, (w, h)) or (None, (0, 0)) on failure.
@@ -8244,6 +8319,7 @@ class App:
             order = ["character", "location"]
         else:
             order = ["character", "location"]
+
 
         for kind in order:
             pool = self.characters if kind == "character" else self.locations
@@ -8331,16 +8407,11 @@ class App:
             profile.visual_cues_from_photos_list = existing_cues
             profile.visual_cues_from_photos = "; ".join(existing_cues)
 
-            traits = self._llm_extract_relevant_traits(dst, analysis_ctx)
-            if traits:
-                profile.dna_traits = self._merge_dna_maps(profile.dna_traits, traits)
 
-        entry["reference_image_ids"] = list(dict.fromkeys(profile.reference_images))
-        entry["visual_cues_from_photos"] = list(profile.visual_cues_from_photos_list or [])
-        if profile.primary_reference_id:
-            entry["primary_reference_id"] = profile.primary_reference_id
-        if profile.dna_traits:
-            entry["dna_traits"] = profile.dna_traits
+        # Initialize per-run budget line on the right
+        self._init_run_budget()
+        ttk.Label(bar, textvariable=self.budget_var, anchor="e").pack(side="right", padx=6)
+
 
         try:
             if world_path:
@@ -8826,110 +8897,106 @@ class App:
         target_size = self._normalize_size(requested)
     
         try:
-            prompt_for_api = self._augment_prompt_for_render(prompt)
-            if refs:
-                return self.client.generate_images_b64_with_refs(
-                    model=self.image_model,
-                    prompt=prompt_for_api,
-                    size=target_size,
-                    ref_data_uris=refs,
-                    n=n
-                )
-            return self.client.generate_images_b64(
-                model=self.image_model,
-                prompt=prompt_for_api,
-                size=target_size,
-                n=n
-            )
-        except Exception as e:
-            raise RuntimeError(f"Image generation failed ({target_size}): {e}") from e
+            styles = (self.world or {}).get("style_presets") or []
+        except Exception:
+            styles = []
+        if sid:
+            for preset in styles:
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    name = (preset.get("name") or preset.get("id") or "").strip()
+                    return preset, name
+        return None, ""
 
 
-    def _current_exposure_settings(self) -> tuple[float, bool, float]:
-        try:
-            bias = float(getattr(self, "exposure_bias", EXPOSURE_BIAS))
-        except Exception:
-            bias = float(EXPOSURE_BIAS)
-        try:
-            post = bool(getattr(self, "post_tonemap", EXPOSURE_POST_TONEMAP))
-        except Exception:
-            post = bool(EXPOSURE_POST_TONEMAP)
-        try:
-            emiss = float(getattr(self, "emissive_level", EMISSIVE_LEVEL))
-        except Exception:
-            emiss = float(EMISSIVE_LEVEL)
-        return bias, post, emiss
+    def _style_prompt_bits(self) -> List[str]:
+        bits: List[str] = []
+        preset, _ = self._resolve_selected_style()
+        if not preset:
+            return bits
+        desc = (preset.get("style_prompt") or "").strip()
+        if desc:
+            bits.append("Style: " + desc)
+        palette = [c for c in (preset.get("palette") or []) if c][:4]
+        if palette:
+            bits.append("Style palette: " + ", ".join(palette))
+        return bits
 
-    def _augment_prompt_for_render(self, prompt: str) -> str:
-        bias, _, emiss = self._current_exposure_settings()
-        try:
-            base = str(prompt or "")
-        except Exception:
-            base = ""
-        cleaned_lines: list[str] = []
-        for line in base.splitlines():
-            strip = line.strip().lower()
-            if strip.startswith("exposure control:") or strip.startswith("emissive lighting:"):
+
+    def _current_style_snapshot(self) -> Dict[str, Any]:
+        preset, preset_name = self._resolve_selected_style()
+        if preset:
+            return {
+                "preset": preset,
+                "id": preset.get("id", ""),
+                "name": preset_name or preset.get("name", ""),
+            }
+        fallback_name = getattr(self, "selected_style_name", "") or getattr(self, "global_style", "")
+        return {"preset": None, "id": "", "name": fallback_name}
+
+
+    def _load_user_styles(self) -> None:
+        styles_list = []
+        if isinstance(self.world, dict):
+            raw = self.world.get("style_presets")
+            if isinstance(raw, list):
+                styles_list = raw
+        self._user_styles = styles_list
+
+        payload = _read_json_safely(_styles_store_path())
+        if isinstance(payload, dict):
+            source = payload.get("styles") or payload.get("style_presets") or []
+        elif isinstance(payload, list):
+            source = payload
+        else:
+            source = []
+
+
+        for entry in source:
+            if not isinstance(entry, dict):
                 continue
-            cleaned_lines.append(line)
-        base_txt = "\n".join(cleaned_lines).strip()
-        parts: list[str] = [base_txt] if base_txt else []
-        parts.append("Exposure control: " + exposure_language(bias))
-        if abs(emiss) >= 0.15:
-            parts.append("Emissive lighting: " + emissive_language(emiss))
-        augmented = "\n".join(parts)
-        try:
-            print(f"[prompt] exposure={bias:+.2f} emissive={emiss:+.2f}")
-        except Exception:
-            pass
-        return augmented
+            sid = (entry.get("id") or "").strip()
+            if sid and sid in existing_by_id:
+                try:
+                    existing_by_id[sid].update(entry)
+                except Exception:
+                    pass
+            else:
+                self._user_styles.append(entry)
+                if sid:
+                    existing_by_id[sid] = entry
 
-    def _process_generated_image(
-        self, raw: bytes, ext: str | None = None, *, need_image: bool = False
-    ) -> tuple[bytes, Optional["Image.Image"]]:
-        bias, post, _ = self._current_exposure_settings()
-        processed = raw
-        img_obj: Optional["Image.Image"] = None
-        log_msg = None
-        if post and abs(bias) >= 0.05:
+        if isinstance(self.world, dict):
+            self.world["style_presets"] = self._user_styles
+
+
+    def _save_user_styles(self) -> None:
+        try:
+            styles = [s for s in getattr(self, "_user_styles", []) if isinstance(s, dict)]
+            payload = {"styles": styles}
+            path = _styles_store_path()
+            ensure_dir(os.path.dirname(path) or ".")
+            _write_json_atomic(path, payload)
+        except Exception as exc:
             try:
-                buf = io.BytesIO(raw)
-                with Image.open(buf) as im:
-                    im.load()
-                    tonemapped = apply_exposure_tonemap(im, bias)
-                    out_buf = io.BytesIO()
-                    fmt = None
-                    if ext:
-                        fmt = {
-                            ".png": "PNG",
-                            ".jpg": "JPEG",
-                            ".jpeg": "JPEG",
-                            ".webp": "WEBP",
-                        }.get(ext.lower())
-                    if not fmt:
-                        fmt = tonemapped.format or "PNG"
-                    save_img = tonemapped
-                    if fmt == "JPEG" and tonemapped.mode == "RGBA":
-                        save_img = tonemapped.convert("RGB")
-                    save_img.save(out_buf, format=fmt)
-                    processed = out_buf.getvalue()
-                    img_obj = tonemapped.copy()
-                    log_msg = f"[exposure] post tone-map applied (bias={bias:+.2f})"
-            except Exception as e:
-                log_msg = f"[exposure] tone-map skipped: {e}"
-                img_obj = None
-                processed = raw
-        if need_image and img_obj is None:
-            try:
-                buf = io.BytesIO(processed)
-                with Image.open(buf) as im:
-                    im.load()
-                    img_obj = im.copy()
+                print(f"[style] warning: failed to save user styles: {exc}")
             except Exception:
-                img_obj = None
-        if log_msg:
+                pass
+
+
+    def _merge_styles_for_dropdown(self) -> None:
+        try:
+            if not isinstance(self.world, dict):
+                return
+            styles = getattr(self, "_user_styles", None)
+            if styles is None:
+                styles = []
+            current = self.world.setdefault("style_presets", [])
+            if current is not styles:
+                self.world["style_presets"] = styles
+            self._refresh_style_dropdown(preserve_selection=False)
+        except Exception:
             try:
-                print(log_msg)
+                self._refresh_style_dropdown(preserve_selection=False)
             except Exception:
                 pass
         return processed, img_obj
@@ -9139,6 +9206,7 @@ class App:
             pass
     
         # Robust coverage fallback
+
         try:
             coverage = (self.batch_coverage_mode.get() or "min").strip().lower()
         except Exception:
@@ -9402,6 +9470,7 @@ class App:
                 except Exception:
                     pass
 
+
     def _refresh_style_dropdown(self, preserve_selection: bool = True) -> None:
         combo = getattr(self, "style_combo", None)
         if combo is None:
@@ -9514,6 +9583,9 @@ class App:
                 print(f"[style] export failed: {exc}")
             return
 
+
+        # Snapshot min-words knob on the UI thread so worker threads don't touch Tk state
+        batch_min_words = None
         try:
             base = os.path.splitext(out_path)[0]
             for idx, path in enumerate(_style_preview_paths(self, target), start=1):
@@ -10046,8 +10118,16 @@ class App:
                     desired_display = id_map.get(dsid)
                     if desired_display:
                         self.selected_style_id = dsid
+
             except Exception:
                 pass
+            try:
+                if self.world_store_path:
+                    self._save_world_store_to(self.world_store_path)
+            except Exception:
+                pass
+            rebuild_list(select_id=preset.get("id"))
+            self._refresh_style_dropdown(preserve_selection=False)
 
         # 3) Next, prefer a previously selected style name when it’s builtin
         if not desired_display and not self.selected_style_id and self.global_style:
@@ -10107,6 +10187,7 @@ class App:
             except Exception:
                 print("[style] select a user style to export")
             return
+
 
         default_name = (target.get("name") or target.get("id") or "style").strip() or "style"
         default_name = sanitize_name(default_name) or "style"
@@ -10235,6 +10316,7 @@ class App:
         except Exception as exc:
             try:
                 messagebox.showerror("Import failed", str(exc))
+
             except Exception:
                 print(f"[style] import failed: {exc}")
 
@@ -10527,6 +10609,89 @@ class App:
         )
         if not in_path:
             return
+
+        try:
+            data = _read_json_safely(in_path)
+            if not isinstance(data, dict):
+                raise ValueError("Not a JSON object")
+            style = data.get("style") if isinstance(data.get("style"), dict) else data
+            if not isinstance(style, dict):
+                raise ValueError("Invalid style structure")
+            sid = (style.get("id") or "").strip()
+            name = (style.get("name") or "").strip()
+            if not name:
+                name = sid or f"Imported_{int(time.time())}"
+                style["name"] = name
+            if not sid:
+                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
+                style["id"] = sid
+
+            user_styles = getattr(self, "_user_styles", []) or []
+            conflict_idx = -1
+            for idx, preset in enumerate(user_styles):
+                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
+                    conflict_idx = idx
+                    break
+
+            if conflict_idx >= 0:
+                try:
+                    replace = messagebox.askyesno(
+                        "Import Style",
+                        f"Style id '{sid}' already exists.\nYes = Replace, No = Keep both.",
+                    )
+                except Exception:
+                    replace = True
+                if replace:
+                    user_styles[conflict_idx] = style
+                else:
+                    sid = f"{sid}_dup{int(time.time())}"
+                    style["id"] = sid
+                    user_styles.append(style)
+            else:
+                user_styles.append(style)
+
+            self.selected_style_id = sid
+            self.selected_style_name = style.get("name", "")
+            try:
+                self._save_user_styles()
+            except Exception:
+                pass
+
+            try:
+                if self.world_store_path:
+                    # persist default selection so the app doesn't revert to builtin on restart
+                    self.world["default_style_id"] = sid
+                    self._save_world_store_to(self.world_store_path)
+            except Exception:
+                pass
+
+            # Rebuild dropdown and select this style
+            try:
+                self._merge_styles_for_dropdown()
+            except Exception:
+                self._refresh_style_dropdown(preserve_selection=True)
+
+            # Show it selected in the combobox
+            try:
+                combo = getattr(self, "style_combo", None)
+                # _build_style_combo_options() keeps a map id->display; use it if present
+                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
+                if combo and display:
+                    combo.set(display)
+                    # notify selection logic
+                    self._on_style_selected()
+            except Exception:
+                pass
+
+            try:
+                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
+            except Exception:
+                print(f"[style] imported '{self.selected_style_name}'")
+        except Exception as exc:
+            try:
+                messagebox.showerror("Import failed", str(exc))
+            except Exception:
+                print(f"[style] import failed: {exc}")
 
 
     def import_style_from_path(self, path: str) -> str:
@@ -10877,362 +11042,6 @@ class App:
             rebuild_list()
             self._refresh_style_dropdown(preserve_selection=False)
 
-
-        # Refresh Story/Scenes tab UI
-        try:
-            self.scenes_by_id = {s.get("id",""): s for s in (self.analysis.get("scenes") or []) if s.get("id")}
-            self._render_scene_table()
-            self._render_precis_and_movements()
-        except Exception:
-            pass
-
-        # Refresh Characters & Locations panes
-        try:
-            self._rebuild_character_panels()
-            self._rebuild_location_panels()
-        except Exception:
-            pass
-
-        self._set_status("Imported prior analysis.")
-        messagebox.showinfo("Analysis import", "Analysis loaded and applied.")
-
-    def _build_style_combo_options(self) -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
-        values: List[str] = []
-        mapping: Dict[str, Dict[str, Any]] = {}
-        id_map: Dict[str, str] = {}
-
-        seen: set[str] = set()
-        for name in GLOBAL_STYLE_CHOICES:
-            label = name
-            values.append(label)
-            mapping[label] = {"kind": "builtin", "name": label}
-            seen.add(label)
-
-        styles: List[Dict[str, Any]]
-        try:
-            styles = [s for s in (self.world or {}).get("style_presets", []) if isinstance(s, dict)]
-        except Exception:
-            styles = []
-
-        if styles:
-            separator = "— User Styles —"
-            values.append(separator)
-            mapping[separator] = {"kind": "separator"}
-            seen.add(separator)
-            for preset in styles:
-                base = (preset.get("name") or preset.get("id") or "User style").strip() or "User style"
-                display = base
-                suffix = 2
-                while display in seen:
-                    display = f"{base} ({suffix})"
-                    suffix += 1
-                values.append(display)
-                mapping[display] = {"kind": "user", "preset": preset}
-                seen.add(display)
-                pid = (preset.get("id") or "").strip()
-                if pid:
-                    id_map[pid] = display
-
-        return values, mapping, id_map
-
-    def _apply_style_selection_from_display(self, display: str, *, quiet: bool = False) -> None:
-        info = self._style_combo_mapping.get(display)
-        if not info:
-            self.selected_style_id = ""
-            self.selected_style_name = display
-            if display:
-                self.global_style = display
-            return
-
-        kind = info.get("kind")
-        if kind == "separator":
-            return
-        if kind == "user":
-            preset = info.get("preset") or {}
-            pid = (preset.get("id") or "").strip()
-            self.selected_style_id = pid
-            self.selected_style_name = (preset.get("name") or preset.get("id") or "").strip()
-            if self.selected_style_name:
-                self.global_style = self.selected_style_name
-            if not quiet:
-                try:
-                    self._set_status(f"Style preset: {self.selected_style_name}")
-                except Exception:
-                    pass
-        else:
-            self.selected_style_id = ""
-            self.selected_style_name = display
-            if display:
-                self.global_style = display
-            if not quiet:
-                try:
-                    self._set_status(f"Global style: {display}")
-                except Exception:
-                    pass
-
-    def _refresh_style_dropdown(self, preserve_selection: bool = True) -> None:
-        combo = getattr(self, "style_combo", None)
-        if combo is None:
-            return
-
-        values, mapping, id_map = self._build_style_combo_options()
-        self._style_combo_mapping = mapping
-        self._style_display_by_id = id_map
-        try:
-            combo.configure(values=values)
-        except Exception:
-            combo["values"] = values
-
-        desired_display = None
-        # 1) If we were told to preserve, try the currently selected style id
-        if preserve_selection and self.selected_style_id:
-            desired_display = id_map.get(self.selected_style_id)
-
-        # 2) If no selection yet, prefer default_style_id from world.json
-        if not desired_display:
-            try:
-                dsid = (self.world or {}).get("default_style_id") or ""
-                if dsid:
-                    desired_display = id_map.get(dsid)
-                    if desired_display:
-                        self.selected_style_id = dsid
-            except Exception:
-                pass
-
-        # 3) Next, prefer a previously selected style name when it’s builtin
-        if not desired_display and not self.selected_style_id and self.global_style:
-            info = mapping.get(self.global_style)
-            if info and info.get("kind") == "builtin":
-                desired_display = self.global_style
-
-        # 4) Otherwise pick the first non-separator item
-        if not desired_display:
-            for candidate in values:
-                info = mapping.get(candidate)
-                if info and info.get("kind") != "separator":
-                    desired_display = candidate
-                    break
-        if desired_display:
-            try:
-                combo.set(desired_display)
-            except Exception:
-                pass
-            self._apply_style_selection_from_display(desired_display, quiet=True)
-
-    def _on_style_selected(self, _event=None):
-        combo = getattr(self, "style_combo", None)
-        if combo is None:
-            return
-        current = combo.get().strip()
-        info = self._style_combo_mapping.get(current)
-        if info and info.get("kind") == "separator":
-            previous_display = None
-            if self.selected_style_id:
-                previous_display = self._style_display_by_id.get(self.selected_style_id)
-            if not previous_display:
-                previous_display = self.selected_style_name or self.global_style or GLOBAL_STYLE_DEFAULT
-            if previous_display:
-                try:
-                    combo.set(previous_display)
-                except Exception:
-                    pass
-                self._apply_style_selection_from_display(previous_display, quiet=True)
-            return
-        self._apply_style_selection_from_display(current, quiet=False)
-        self._refresh_style_dropdown(preserve_selection=True)
-
-    def _export_style_dialog(self):
-        if getattr(self, "root", None) is None:
-            print("[style] export not available in headless mode")
-            return
-        sel_id = (getattr(self, "selected_style_id", "") or "").strip()
-        target = None
-        for preset in getattr(self, "_user_styles", []) or []:
-            if isinstance(preset, dict) and (preset.get("id") or "").strip() == sel_id:
-                target = preset
-                break
-        if not target:
-            try:
-                messagebox.showinfo("Export Style", "Select a user style to export.")
-            except Exception:
-                print("[style] select a user style to export")
-            return
-
-        default_name = (target.get("name") or target.get("id") or "style").strip() or "style"
-        default_name = sanitize_name(default_name) or "style"
-        out_path = filedialog.asksaveasfilename(
-            title="Export Style",
-            defaultextension=".style.json",
-            initialfile=f"{default_name}.style.json",
-            filetypes=[("Style JSON", "*.style.json"), ("JSON", "*.json"), ("All Files", "*.*")],
-        )
-        if not out_path:
-            return
-
-        payload = _style_export_minimal_dict(target)
-        try:
-            ensure_dir(os.path.dirname(out_path) or ".")
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            try:
-                messagebox.showerror("Export failed", str(exc))
-            except Exception:
-                print(f"[style] export failed: {exc}")
-            return
-
-        try:
-            base = os.path.splitext(out_path)[0]
-            for idx, path in enumerate(_style_preview_paths(self, target), start=1):
-                thumb_path = f"{base}.preview{idx}.jpg"
-                _save_thumb(path, thumb_path, max_side=320)
-        except Exception:
-            pass
-
-        try:
-            messagebox.showinfo("Export Style", f"Exported '{target.get('name', '(unnamed)')}'.")
-        except Exception:
-            print(f"[style] exported '{target.get('name', '(unnamed)')}' → {out_path}")
-
-    def _import_style_dialog(self):
-        if getattr(self, "root", None) is None:
-            print("[style] import not available in headless mode")
-            return
-        in_path = filedialog.askopenfilename(
-            title="Import Style",
-            filetypes=[("Style JSON", "*.style.json *.json"), ("All Files", "*.*")],
-        )
-        if not in_path:
-            return
-
-        try:
-            data = _read_json_safely(in_path)
-            if not isinstance(data, dict):
-                raise ValueError("Not a JSON object")
-            style = data.get("style") if isinstance(data.get("style"), dict) else data
-            if not isinstance(style, dict):
-                raise ValueError("Invalid style structure")
-            sid = (style.get("id") or "").strip()
-            name = (style.get("name") or "").strip()
-            if not name:
-                name = sid or f"Imported_{int(time.time())}"
-                style["name"] = name
-            if not sid:
-                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
-                style["id"] = sid
-
-            user_styles = getattr(self, "_user_styles", []) or []
-            conflict_idx = -1
-            for idx, preset in enumerate(user_styles):
-                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    conflict_idx = idx
-                    break
-
-            if conflict_idx >= 0:
-                try:
-                    replace = messagebox.askyesno(
-                        "Import Style",
-                        f"Style id '{sid}' already exists.\nYes = Replace, No = Keep both.",
-                    )
-                except Exception:
-                    replace = True
-                if replace:
-                    user_styles[conflict_idx] = style
-                else:
-                    sid = f"{sid}_dup{int(time.time())}"
-                    style["id"] = sid
-                    user_styles.append(style)
-            else:
-                user_styles.append(style)
-
-            self.selected_style_id = sid
-            self.selected_style_name = style.get("name", "")
-            try:
-                self._save_user_styles()
-            except Exception:
-                pass
-
-            try:
-                if self.world_store_path:
-                    # persist default selection so the app doesn't revert to builtin on restart
-                    self.world["default_style_id"] = sid
-                    self._save_world_store_to(self.world_store_path)
-            except Exception:
-                pass
-
-            # Rebuild dropdown and select this style
-            try:
-                self._merge_styles_for_dropdown()
-            except Exception:
-                self._refresh_style_dropdown(preserve_selection=True)
-
-            # Show it selected in the combobox
-            try:
-                combo = getattr(self, "style_combo", None)
-                # _build_style_combo_options() keeps a map id->display; use it if present
-                display = getattr(self, "_style_display_by_id", {}).get(sid) or self.selected_style_name
-                if combo and display:
-                    combo.set(display)
-                    # notify selection logic
-                    self._on_style_selected()
-            except Exception:
-                pass
-
-            try:
-                messagebox.showinfo("Import Style", f"Imported '{self.selected_style_name}'.")
-            except Exception:
-                print(f"[style] imported '{self.selected_style_name}'")
-        except Exception as exc:
-            try:
-                messagebox.showerror("Import failed", str(exc))
-            except Exception:
-                print(f"[style] import failed: {exc}")
-
-    def import_style_from_path(self, path: str) -> str:
-        """
-        Import a style preset from a .style.json or .json file and make it the default selection.
-        Returns the preset id, or '' on failure.
-        """
-        try:
-            data = _read_json_safely(path)
-            if not isinstance(data, dict):
-                raise ValueError("Not a JSON object")
-            style = data.get("style") if isinstance(data.get("style"), dict) else data
-            if not isinstance(style, dict):
-                raise ValueError("Invalid style structure")
-            sid = (style.get("id") or "").strip()
-            name = (style.get("name") or "").strip()
-            if not name:
-                name = sid or f"Imported_{int(time.time())}"
-                style["name"] = name
-            if not sid:
-                sid = f"style_{int(time.time())}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:6]}"
-                style["id"] = sid
-
-            user_styles = getattr(self, "_user_styles", []) or []
-            # Replace if id exists, else append
-            for idx, preset in enumerate(user_styles):
-                if isinstance(preset, dict) and (preset.get("id") or "").strip() == sid:
-                    user_styles[idx] = style
-                    break
-            else:
-                user_styles.append(style)
-
-            self.selected_style_id = sid
-            self.selected_style_name = style.get("name", "")
-            self.global_style = self.selected_style_name or self.global_style
-
-            try:
-                self._save_user_styles()
-            except Exception:
-                pass
-            try:
-                if self.world_store_path:
-                    self.world["default_style_id"] = sid
-                    self._save_world_store_to(self.world_store_path)
-            except Exception:
-                pass
-
         def _set_default_style():
             selection = style_list.curselection()
             if not selection:
@@ -11254,7 +11063,6 @@ class App:
                 self.global_style = self.selected_style_name
             rebuild_list(select_id=sid)
             self._refresh_style_dropdown(preserve_selection=False)
-
 
         rename_btn.configure(command=_rename_selected)
         delete_btn.configure(command=_delete_selected)
@@ -11361,7 +11169,6 @@ class App:
         exposure_scale = ttk.Scale(frm, from_=-1.0, to=1.0, orient="horizontal",
                                    variable=self.exposure_bias_var, command=_on_exposure_change)
         exposure_scale.grid(row=11, column=1, sticky="we", padx=6, pady=(8,0))
-
 
         # ---- Post tone-map toggle ----
         ttk.Label(frm, text="Post tone-map").grid(row=12, column=0, sticky="w", padx=6)
@@ -11801,8 +11608,6 @@ class App:
         out_dir = filedialog.askdirectory(title="Choose a folder for dialogue files")
         if not out_dir:
             return
-
-        src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
 
 
         src_path = getattr(self, "_last_story_path", "") or getattr(self, "input_text_path", "")
@@ -12729,7 +12534,6 @@ class App:
         if not path:
             label.config(text="(No valid image on disk)")
             return
-
 
         imtk, _ = self._load_thumb(path, max_side=168)
         if not imtk:
@@ -14040,6 +13844,7 @@ class App:
         return {"json": result["json_path"], "marked": result["txt_path"]}
 
 
+
     def _inject_extra_scenes_by_word_gap(self, min_words: int) -> int:
         """
         NEW IMPLEMENTATION:
@@ -14670,11 +14475,11 @@ class App:
         except Exception as exc:
             print(f"[DIALOGUE] analysis/emit failed: {exc}")
 
-
         if errors:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
         else:
             messagebox.showinfo("Export", "Export completed to:\n" + outdir)
+
 
 
 
