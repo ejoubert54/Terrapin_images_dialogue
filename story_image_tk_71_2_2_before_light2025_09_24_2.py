@@ -30,6 +30,7 @@ import glob
 import math
 import statistics
 from collections import defaultdict
+
 import bisect
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -154,6 +155,7 @@ def _segment_lines(text: str) -> List[str]:
 # -------------------------------------------------------------
 # Hybrid dialogue extraction & attribution (rule-first, LLM optional)
 # -------------------------------------------------------------
+
 
 def _now_utc() -> int:
     return int(time.time())
@@ -2230,6 +2232,7 @@ def _contrast_norm(img: Image.Image) -> float:
         return 0.5
 
 
+
 def _colorfulness(img: Image.Image) -> float:
     try:
         im = img.convert("RGB").resize((128, 128))
@@ -2356,9 +2359,11 @@ def _llm_style_summary(self, sample_paths: List[str], analysis_ctx: str, fallbac
             if imgs:
                 user_payload.extend(imgs)
 
+
         # Always include a text hint describing the metrics already computed offline
         if fallback:
             user_payload.append({"type": "text", "text": "Offline cues to incorporate: " + fallback})
+
 
         data = client.chat_json(
             model=model,
@@ -3677,6 +3682,7 @@ def exposure_language(level: float) -> str:
         return "low-key look; deeper shadows; avoid crushed blacks; controlled highlights"
     return "neutral exposure; natural contrast; avoid crushed blacks or clipped highlights"
 
+
 def emissive_language(level: float) -> str:
     """Prompt-only hint for diegetic/practical light sources."""
     try:
@@ -3691,6 +3697,7 @@ def emissive_language(level: float) -> str:
     if l <= -0.33:
         return "no bloom; crisp practical lighting; avoid glows"
     return "naturalistic practical lighting with restrained bloom"
+
 
 def compose_character_dna(c: CharacterProfile, max_len: int = 3000) -> str:
     parts = []
@@ -11935,12 +11942,14 @@ class App:
         self._rebuild_character_panels()
         self._set_status("Imported character JSON for " + name)
 
+
     def _on_export_character_folder(self, name: str):
         c = self.characters[name]
         outdir = filedialog.askdirectory(title="Choose a folder to export this character")
         if not outdir: return
         char_dir = os.path.join(outdir, sanitize_name(name))
         ensure_dir(char_dir)
+
 
         exported = []
         for vkey, imgs in c.sheet_images.items():
@@ -11993,6 +12002,7 @@ class App:
         except Exception:
             same = (os.path.abspath(char_dir) == os.path.abspath(repo_dir))
 
+
         if same:
             messagebox.showinfo("Export", "Character exported to:\n" + char_dir)
         else:
@@ -12011,6 +12021,7 @@ class App:
             return
         for n in todo:
             self._on_propose_char_baseline(n)
+
 
     def _on_bulk_generate_char_views(self):
         todo = [n for n, p in self.char_panels.items() if p["select_var"].get()]
@@ -12217,13 +12228,16 @@ class App:
         lb: Optional[tk.Listbox] = panel.get("ref_list") if panel else None
         if not canvas or not label:
             return
+
         canvas.delete("all")
         panel["thumb_image"] = None
+
 
         c_obj = self.characters.get(name)
         if not c_obj:
             label.config(text="")
             return
+
 
         pri = (c_obj.primary_reference_id or "").strip()
         ids = list(c_obj.reference_images or [])
@@ -12249,6 +12263,7 @@ class App:
         if not path:
             label.config(text="(No valid image on disk)")
             return
+
 
         imtk, _ = self._load_thumb(path, max_side=168)
         if not imtk:
@@ -14141,6 +14156,7 @@ class App:
                                 if sh.continuity_notes:
                                     entry["notes"] = sh.continuity_notes
 
+
                                 shot_entries.append(entry)
                     if not shot_entries and primary_prompt:
                         # Fallback: at least one shot
@@ -14188,6 +14204,7 @@ class App:
             )
         except Exception as exc:
             print(f"[DIALOGUE] analysis/emit failed: {exc}")
+
 
         if errors:
             messagebox.showerror("Export finished with errors", "Some scenes failed:\n- " + "\n- ".join(errors))
