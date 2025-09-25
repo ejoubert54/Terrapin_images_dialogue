@@ -888,8 +888,10 @@ class LLMAssistedAttributor:
         aliases: Optional[Dict[str, List[str]]],
         conf_threshold: float = 0.92,
         batch_size: int = 8,
+
         model: Optional[str] = None,
         client: Optional["OpenAIClient"] = None,
+
     ) -> None:
         self.known = known_characters or []
         self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
@@ -1059,6 +1061,7 @@ def _apply_llm_assist(
         model=llm_model,
         client=client,
     )
+
     proposals = agent.propose(full_text, pending) or []
     id_map = {u["utterance_id"]: u for u in utterances}
     name_re = re.compile(DialogueExtractor.NAME_RE)
@@ -1249,6 +1252,7 @@ def extract_and_save_dialogue(
     LLM client. Outputs are written using the ``_dialogue_marked.txt`` and
     ``_analysis_dialogue.json`` suffixes beside ``base_output_path``.
     """
+
     extractor = DialogueExtractor(
         known_characters=known_characters,
         aliases=character_aliases,
@@ -1267,6 +1271,7 @@ def extract_and_save_dialogue(
             llm_batch_size,
             llm_model=llm_model,
             client=llm_client,
+
         )
     return _write_sidecars(
         base_output_path,
@@ -1274,6 +1279,7 @@ def extract_and_save_dialogue(
         voices_map,
         llm_enabled=use_llm_assist,
         llm_model=llm_model,
+
         llm_conf_threshold=llm_conf_threshold,
     )
 
@@ -13065,6 +13071,11 @@ class App:
         base = src.stem if src else "story"
         outp = Path(out_dir or (src.parent if src else Path.cwd()))
         outp.mkdir(parents=True, exist_ok=True)
+        story_text = getattr(self, "_dialogue_story_text_cache", "")
+        if not story_text:
+            story_text = getattr(self, "_last_story_text", "")
+        if not story_text:
+            story_text = ""
 
         story_text = getattr(self, "_dialogue_story_text_cache", "")
         if not story_text:
