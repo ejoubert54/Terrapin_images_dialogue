@@ -469,7 +469,6 @@ class DialogueExtractor:
         utterances = self._interleave_narrator(self._text, speeches, self._line_starts)
         self._attribute_all(self._text, utterances)
         self._fuse_narrator_cues(self._text, utterances)
-
         if self.mode == "permissive":
             self._apply_permissive_rules(self._text, utterances)
         self._enforce_closed_set(utterances)
@@ -1027,7 +1026,6 @@ class LLMAssistedAttributor:
         return outputs
 
 
-
 def _apply_llm_assist(
     full_text: str,
     utterances: List[Dict[str, Any]],
@@ -1037,7 +1035,6 @@ def _apply_llm_assist(
     batch_size: int,
     llm_model: Optional[str] = None,
     client: Optional["OpenAIClient"] = None,
-
 ) -> None:
     pending: List[Dict[str, Any]] = []
     for utterance in utterances:
@@ -1155,7 +1152,6 @@ def _enforce_closed_set_after_llm(
             utterance["character"] = canonical
 
 
-
 def _write_sidecars(
     base_output_path: str,
     utterances: List[Dict[str, Any]],
@@ -1246,11 +1242,17 @@ def extract_and_save_dialogue(
     llm_conf_threshold: float = 0.92,
     llm_batch_size: int = 8,
     max_narrator_chars: Optional[int] = None,
-
     llm_model: Optional[str] = None,
     llm_client: Optional["OpenAIClient"] = None,
-
 ) -> Dict[str, str]:
+    """Extract dialogue from ``story_text`` and write the sidecar artifacts.
+
+    The deterministic extractor always runs first; when ``use_llm_assist`` is
+    enabled a second pass verifies potential assignments via the configured
+    LLM client. Outputs are written using the ``_dialogue_marked.txt`` and
+    ``_analysis_dialogue.json`` suffixes beside ``base_output_path``.
+    """
+
     extractor = DialogueExtractor(
         known_characters=known_characters,
         aliases=character_aliases,
@@ -1267,7 +1269,6 @@ def extract_and_save_dialogue(
             character_aliases,
             llm_conf_threshold,
             llm_batch_size,
-
             llm_model=llm_model,
             client=llm_client,
 
@@ -1277,7 +1278,6 @@ def extract_and_save_dialogue(
         utterances,
         voices_map,
         llm_enabled=use_llm_assist,
-
         llm_model=llm_model,
 
         llm_conf_threshold=llm_conf_threshold,
@@ -2280,7 +2280,24 @@ def distribute_extra_shots_after_final_plan(analysis: dict,
                                             tolerance: float = EXTRA_TOLERANCE,
                                             max_total: int = EXTRA_MAX_TOTAL,
                                             dry_run: bool = False) -> dict:
-    """Add extra shot stubs proportionally across scenes once plan is final."""
+    """Distribute extra shot placeholders across the final scene plan.
+
+    Args:
+        analysis: Parsed story analysis containing scene metadata.
+        captions_map: Captions/scene plan to update.
+        story_text: Raw story text used to compute fallback word counts.
+        every_words: Target spacing between extra shots (words per extra).
+        min_words: Minimum total words required before scheduling extras.
+        tolerance: Fractional tolerance when rounding planned extras.
+        max_total: Upper bound on extra shots to schedule.
+        dry_run: When True, compute the plan but leave ``captions_map``
+            untouched.
+
+    Returns:
+        Either the original ``captions_map`` (when no action taken) or a new
+        mapping with ``extra`` shots added to each scene according to the
+        computed plan.
+    """
 
     global LAST_EXTRA_SHOT_REPORT
 
@@ -2429,6 +2446,14 @@ def _maybe_expand_scenes(analysis_path: str,
                          captions_path: str,
                          dry_run: bool = False,
                          extra_dry_run: bool = False):
+    """Expand a captions_map using an analysis JSON on disk.
+
+    Loads the provided analysis and captions files, performs deterministic
+    scene expansion plus optional extra-shot scheduling, and writes the
+    results back unless ``dry_run`` is set. Progress and summaries are emitted
+    via ``print`` statements and captured in module-level globals for UI
+    consumption.
+    """
     global LAST_EXPAND_SCENES_REPORT, LAST_EXPAND_SCENES_STATUS
     try:
         analysis = _read_json(analysis_path)
