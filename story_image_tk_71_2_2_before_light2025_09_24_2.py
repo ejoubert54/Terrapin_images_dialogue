@@ -205,6 +205,7 @@ class DialogueExtractor:
         "snapped",
         "barked",
         "growled",
+        "rasped",
         "sighed",
         "responded",
         "remarked",
@@ -329,6 +330,136 @@ class DialogueExtractor:
             return candidate
         return None
 
+    def _assign_from_narrator(
+        self,
+        utterance: Dict[str, Any],
+        name: str,
+        method: str,
+        score: float,
+        evidence: str,
+    ) -> bool:
+        if not utterance or not name:
+            return False
+        attr = utterance.get("attribution") or {}
+        current_char = utterance.get("character")
+        current_score = float(attr.get("score") or 0.0)
+        target_score = max(score, self.ct if self.ct else 0.0)
+        if method == "merged_narrator":
+            target_score = max(target_score, 0.97)
+        if current_char not in {None, "", "UNATTRIBUTED"} and current_score >= target_score:
+            return False
+        utterance["character"] = name
+        utterance["attribution"] = {
+            "method": method,
+            "score": float(target_score),
+            "evidence": evidence,
+            "name_candidate": name,
+        }
+        return True
+
+    def _narrator_name_hint(self, narrator_text: str) -> Optional[Tuple[str, str]]:
+        if not narrator_text:
+            return None
+        matches: List[Tuple[str, str]] = []
+        for match in re.finditer(self.NAME_RE, narrator_text):
+            canonical = self._canonicalize_name(match.group(0))
+            if not canonical:
+                continue
+            window_start = max(0, match.start() - 60)
+            window_end = min(len(narrator_text), match.end() + 60)
+            window = narrator_text[window_start:window_end]
+            if re.search(self._verb_alt, window, re.IGNORECASE):
+                matches.append((canonical, self._clean_line(window)))
+        unique = {name for name, _ in matches}
+        if len(unique) == 1:
+            name = next(iter(unique))
+            snippet = ""
+            for candidate_name, evidence in matches:
+                if candidate_name == name:
+                    snippet = evidence
+                    break
+            return name, snippet or self._clean_line(narrator_text)
+        return None
+
+    def _narrator_pronoun_hint(self, narrator_text: str) -> Optional[str]:
+        if not narrator_text:
+            return None
+        pronouns = r"(?:he|she|they|him|her|his|hers|their|theirs|himself|herself)"
+        pattern_forward = re.compile(
+            r"\b" + pronouns + r"\b(?:[^A-Za-z]+|\s)+(?:\w+\s+){0,2}(?:" + self._verb_alt + r")\b",
+            re.IGNORECASE,
+        )
+        match = pattern_forward.search(narrator_text)
+        if match:
+            return self._clean_line(match.group(0))
+        pattern_reverse = re.compile(
+            r"(?:" + self._verb_alt + r")\b(?:[^A-Za-z]+|\s)+(?:\w+\s+){0,2}\b" + pronouns + r"\b",
+            re.IGNORECASE,
+        )
+        match = pattern_reverse.search(narrator_text)
+        if match:
+            return self._clean_line(match.group(0))
+        return None
+
+    def _fuse_narrator_cues(self, text: str, utterances: List[Dict[str, Any]]) -> None:
+        if not utterances:
+            return
+        last_named: Optional[str] = None
+        for idx, utt in enumerate(utterances):
+            character = utt.get("character")
+            if character and character not in {"Narrator", "UNATTRIBUTED"}:
+                last_named = character
+                continue
+            if character != "Narrator":
+                continue
+            span = utt.get("char_span") or [0, 0]
+            seg_text = text[span[0] : span[1]] if text else ""
+            if not seg_text.strip():
+                continue
+            narrator_clean = self._clean_line(seg_text)
+            if not narrator_clean:
+                continue
+            prev_u = utterances[idx - 1] if idx > 0 else None
+            next_u = utterances[idx + 1] if idx + 1 < len(utterances) else None
+            hint = self._narrator_name_hint(seg_text)
+            assigned = False
+            if hint:
+                name, snippet = hint
+                evidence = "narrator:" + (snippet or narrator_clean)
+                score = max(0.97, self.ct or 0.0)
+                if prev_u and prev_u.get("character") == "UNATTRIBUTED":
+                    if self._assign_from_narrator(prev_u, name, "merged_narrator", score, evidence):
+                        last_named = name
+                        assigned = True
+                if next_u and next_u.get("character") == "UNATTRIBUTED":
+                    if self._assign_from_narrator(next_u, name, "merged_narrator", score, evidence):
+                        last_named = name
+                        assigned = True
+                if assigned:
+                    continue
+            pronoun_hint = self._narrator_pronoun_hint(seg_text)
+            if pronoun_hint and last_named:
+                evidence = "narrator_pronoun:" + pronoun_hint
+                score = max(self.ct or 0.0, 0.91)
+                if prev_u and prev_u.get("character") == "UNATTRIBUTED":
+                    if self._assign_from_narrator(
+                        prev_u,
+                        last_named,
+                        "merged_narrator_pronoun",
+                        score,
+                        evidence,
+                    ):
+                        assigned = True
+                if next_u and next_u.get("character") == "UNATTRIBUTED":
+                    if self._assign_from_narrator(
+                        next_u,
+                        last_named,
+                        "merged_narrator_pronoun",
+                        score,
+                        evidence,
+                    ):
+                        assigned = True
+
     def extract(self, text: str) -> List[Dict[str, Any]]:
         self._text = text or ""
         self._line_starts = self._compute_line_starts(self._text)
@@ -337,6 +468,8 @@ class DialogueExtractor:
         speeches = self._detect_speech(self._text)
         utterances = self._interleave_narrator(self._text, speeches, self._line_starts)
         self._attribute_all(self._text, utterances)
+        self._fuse_narrator_cues(self._text, utterances)
+
         if self.mode == "permissive":
             self._apply_permissive_rules(self._text, utterances)
         self._enforce_closed_set(utterances)
@@ -756,14 +889,143 @@ class LLMAssistedAttributor:
         aliases: Optional[Dict[str, List[str]]],
         conf_threshold: float = 0.92,
         batch_size: int = 8,
+
+        model: Optional[str] = None,
+        client: Optional["OpenAIClient"] = None,
+
     ) -> None:
         self.known = known_characters or []
         self.aliases = {k: set(v) for k, v in (aliases or {}).items()}
         self.conf_threshold = float(conf_threshold)
-        self.batch_size = int(batch_size)
+        self.batch_size = max(1, int(batch_size) if batch_size else 1)
+        if model:
+            self.model = model
+        else:
+            self.model = os.environ.get("DIALOGUE_LLM_MODEL", DEFAULT_LLM_MODEL)
+        self.client = client
+        self._client_error = False
 
     def propose(self, full_text: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return []
+        if not candidates or self._client_error:
+            return []
+        client = self.client
+        if not client:
+            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                return []
+            org = os.environ.get("OPENAI_ORG_ID") or None
+            try:
+                client = OpenAIClient(api_key, organization=org)  # type: ignore[name-defined]
+            except Exception:
+                self._client_error = True
+                return []
+            self.client = client
+        allowed = [name for name in self.known if isinstance(name, str) and name.strip()]
+        allowed = list(dict.fromkeys(allowed))
+        alias_payload: Dict[str, List[str]] = {}
+        for name in allowed:
+            raw_aliases = sorted(a for a in self.aliases.get(name, set()) if isinstance(a, str) and a.strip())
+            if raw_aliases:
+                alias_payload[name] = raw_aliases
+        outputs: List[Dict[str, Any]] = []
+        system_prompt = (
+            "You are a dialogue analyst. Attribute quoted speech in prose. Only use characters from this provided list. "
+            "Return a JSON object with a 'results' array; each item must include utterance_id, character, confidence, and "
+            "evidence with optional name_span and verb_span (absolute indices)."
+        )
+        step = self.batch_size or 1
+        for start in range(0, len(candidates), step):
+            chunk = candidates[start : start + step]
+            payload_items = []
+            for item in chunk:
+                uid = item.get("utterance_id")
+                span = item.get("char_span") or [0, 0]
+                ctx_span = item.get("context_span") or span
+                try:
+                    s, e = int(span[0]), int(span[1])
+                    cs, ce = int(ctx_span[0]), int(ctx_span[1])
+                except Exception:
+                    continue
+                s = max(0, min(s, len(full_text)))
+                e = max(s, min(e, len(full_text)))
+                cs = max(0, min(cs, len(full_text)))
+                ce = max(cs, min(ce, len(full_text)))
+                payload_items.append(
+                    {
+                        "utterance_id": uid,
+                        "char_span": [s, e],
+                        "context_span": [cs, ce],
+                        "quote": full_text[s:e],
+                        "context": full_text[cs:ce],
+                    }
+                )
+            if not payload_items:
+                continue
+            user_payload = {
+                "allowed_characters": allowed,
+                "aliases": alias_payload,
+                "utterances": payload_items,
+            }
+            try:
+                data = client.chat_json(
+                    model=self.model,
+                    system=system_prompt,
+                    user=user_payload,
+                    temperature=0.0,
+                )
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                if isinstance(data.get("results"), list):
+                    records = data["results"]
+                elif isinstance(data.get("assignments"), list):
+                    records = data["assignments"]
+                elif isinstance(data.get("utterances"), list):
+                    records = data["utterances"]
+                elif {"utterance_id", "character"}.issubset(data.keys()):
+                    records = [data]
+                else:
+                    records = []
+            elif isinstance(data, list):
+                records = data
+            else:
+                records = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                uid = record.get("utterance_id")
+                character = record.get("character")
+                confidence = record.get("confidence")
+                if not uid or not isinstance(character, str):
+                    continue
+                try:
+                    conf_val = float(confidence)
+                except Exception:
+                    continue
+                if conf_val < self.conf_threshold:
+                    continue
+                if character != "UNATTRIBUTED" and character not in allowed:
+                    continue
+                evidence = {}
+                raw_evidence = record.get("evidence") or {}
+                if isinstance(raw_evidence, dict):
+                    for key in ("name_span", "verb_span"):
+                        span_val = raw_evidence.get(key)
+                        if isinstance(span_val, (list, tuple)) and len(span_val) == 2:
+                            try:
+                                evidence[key] = [int(span_val[0]), int(span_val[1])]
+                            except Exception:
+                                continue
+                outputs.append(
+                    {
+                        "utterance_id": uid,
+                        "character": character,
+                        "confidence": conf_val,
+                        "evidence": evidence,
+                    }
+                )
+        return outputs
+
 
 
 def _apply_llm_assist(
@@ -773,6 +1035,9 @@ def _apply_llm_assist(
     aliases: Optional[Dict[str, List[str]]],
     llm_conf_threshold: float,
     batch_size: int,
+    llm_model: Optional[str] = None,
+    client: Optional["OpenAIClient"] = None,
+
 ) -> None:
     pending: List[Dict[str, Any]] = []
     for utterance in utterances:
@@ -791,7 +1056,15 @@ def _apply_llm_assist(
         )
     if not pending:
         return
-    agent = LLMAssistedAttributor(known_characters, aliases, conf_threshold=llm_conf_threshold, batch_size=batch_size)
+    agent = LLMAssistedAttributor(
+        known_characters,
+        aliases,
+        conf_threshold=llm_conf_threshold,
+        batch_size=batch_size,
+        model=llm_model,
+        client=client,
+    )
+
     proposals = agent.propose(full_text, pending) or []
     id_map = {u["utterance_id"]: u for u in utterances}
     name_re = re.compile(DialogueExtractor.NAME_RE)
@@ -840,6 +1113,47 @@ def _apply_llm_assist(
             "evidence": json.dumps(evidence, ensure_ascii=False),
             "name_candidate": character if character != "UNATTRIBUTED" else None,
         }
+    _enforce_closed_set_after_llm(utterances, known_characters, aliases)
+
+
+def _enforce_closed_set_after_llm(
+    utterances: List[Dict[str, Any]],
+    known_characters: Optional[List[str]],
+    aliases: Optional[Dict[str, List[str]]],
+) -> None:
+    if not known_characters:
+        return
+    alias_lookup: Dict[str, str] = {}
+    for name in known_characters:
+        if isinstance(name, str):
+            alias_lookup[name.lower()] = name
+    for base, vals in (aliases or {}).items():
+        if not isinstance(base, str):
+            continue
+        base_clean = _title_case_name(base)
+        canonical = None
+        for known in known_characters:
+            if isinstance(known, str) and known.lower() == base_clean.lower():
+                canonical = known
+                break
+        if canonical:
+            alias_lookup.setdefault(base_clean.lower(), canonical)
+        for alias in vals or []:
+            if isinstance(alias, str) and canonical:
+                alias_lookup.setdefault(alias.lower(), canonical)
+    for utterance in utterances:
+        char = utterance.get("character")
+        if not isinstance(char, str) or char in {"Narrator", "UNATTRIBUTED"}:
+            continue
+        canonical = alias_lookup.get(char.lower())
+        if not canonical:
+            utterance["character"] = "UNATTRIBUTED"
+            attr = utterance.get("attribution") or {}
+            attr.update({"method": "none", "score": 0.0, "evidence": "", "name_candidate": None})
+            utterance["attribution"] = attr
+        else:
+            utterance["character"] = canonical
+
 
 
 def _write_sidecars(
@@ -932,6 +1246,10 @@ def extract_and_save_dialogue(
     llm_conf_threshold: float = 0.92,
     llm_batch_size: int = 8,
     max_narrator_chars: Optional[int] = None,
+
+    llm_model: Optional[str] = None,
+    llm_client: Optional["OpenAIClient"] = None,
+
 ) -> Dict[str, str]:
     extractor = DialogueExtractor(
         known_characters=known_characters,
@@ -949,13 +1267,19 @@ def extract_and_save_dialogue(
             character_aliases,
             llm_conf_threshold,
             llm_batch_size,
+
+            llm_model=llm_model,
+            client=llm_client,
+
         )
     return _write_sidecars(
         base_output_path,
         utterances,
         voices_map,
         llm_enabled=use_llm_assist,
-        llm_model=None,
+
+        llm_model=llm_model,
+
         llm_conf_threshold=llm_conf_threshold,
     )
 
@@ -12728,6 +13052,12 @@ class App:
         if not story_text:
             story_text = ""
 
+        story_text = getattr(self, "_dialogue_story_text_cache", "")
+        if not story_text:
+            story_text = getattr(self, "_last_story_text", "")
+        if not story_text:
+            story_text = ""
+
         known_chars = getattr(self, "_dialogue_last_known_characters", [])
         alias_map = getattr(self, "_dialogue_last_aliases", {})
         utterances = copy.deepcopy(getattr(self, "_dialogue_last_utterances", []))
@@ -12752,7 +13082,16 @@ class App:
         llm_threshold = float(getattr(self, "dialogue_llm_threshold", 0.92))
         llm_batch = int(getattr(self, "dialogue_llm_batch_size", 8))
         if llm_enabled and story_text and utterances:
-            _apply_llm_assist(story_text, utterances, known_chars, alias_map, llm_threshold, llm_batch)
+            _apply_llm_assist(
+                story_text,
+                utterances,
+                known_chars,
+                alias_map,
+                llm_threshold,
+                llm_batch,
+                llm_model=llm_model,
+                client=getattr(self, "client", None),
+            )
 
         voices_map = getattr(self, "dialogue_voices_map", None)
         if not isinstance(voices_map, dict):
